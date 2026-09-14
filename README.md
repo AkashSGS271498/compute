@@ -1,6 +1,6 @@
 # Personal Distributed Compute Network
 
-> Turn your idle laptop into an on-demand, isolated compute worker.
+> Turn your idle laptops into an on-demand distributed compute cluster.
 
 ---
 
@@ -8,115 +8,270 @@
 
 Modern workflows often involve having multiple personal machines (e.g., Laptop A and Laptop B). While working on Laptop A, Laptop B frequently sits idle with unused CPU and RAM resources.
 
-**The Solution**: A lightweight personal distributed compute system where Laptop A (Controller) submits compute jobs over the network, and Laptop B (Worker) executes them inside an isolated sandbox and returns the stdout, stderr, and results to Laptop A.
+**The Solution**: A lightweight personal distributed compute system where:
+- A **central backend** (running on Laptop A) coordinates all jobs and workers.
+- One or more **worker nodes** (running on other laptops) auto-register with the backend, execute jobs, and send heartbeats.
+- A **controller script** (on Laptop A) submits jobs to the backend, which dispatches them to available workers and returns the result.
 
 ---
 
-## 2. Milestone 1 Architecture
+## 2. Architecture
 
-Milestone 1 establishes direct HTTP communication between Laptop A and Laptop B across the local network (LAN / Wi-Fi).
+### Milestone 2 – Central Backend + Worker Registration
 
 ```text
-+------------------------------------+
-|        Laptop A (Controller)       |
-|                                    |
-|   python scripts/test_milestone1.py|
-+-----------------+------------------+
-                  |
-                  | HTTP GET http://<LAPTOP_B_IP>:8001/
-                  v
-       [ Local Network / Wi-Fi ]
-                  |
-                  | Windows Firewall (TCP Port 8001)
-                  v
-+-----------------+------------------+
-|          Laptop B (Worker)         |
-|                                    |
-|   FastAPI / Uvicorn (0.0.0.0:8001) |
-|   Returns: "Hello from worker"     |
-+------------------------------------+
++-----------------------------------------------+
+|              Laptop A (Controller)             |
+|                                                |
+|   ┌─────────────────────────────────────┐      |
+|   │  Backend  (FastAPI :8000)           │      |
+|   │                                     │      |
+|   │  POST /register   ◄── Worker        │      |
+|   │  POST /heartbeat  ◄── Worker        │      |
+|   │  POST /submit     ◄── Controller    │      |
+|   │  GET  /workers    ◄── Controller    │      |
+|   └─────────────────────────────────────┘      |
+|                                                |
+|   scripts/submit_job.py  (Controller CLI)      |
++-------------------+----------------------------+
+                    |
+         Local Network / Wi-Fi
+                    |
++-------------------+----------------------------+
+|              Laptop B (Worker)                 |
+|                                                |
+|   ┌─────────────────────────────────────┐      |
+|   │  Worker  (FastAPI/Uvicorn :8001)    │      |
+|   │                                     │      |
+|   │  POST /run     ◄── Backend dispatch │      |
+|   │  GET  /health  ◄── Liveness probe   │      |
+|   │  GET  /        ◄── Status           │      |
+|   └─────────────────────────────────────┘      |
++-----------------------------------------------+
 ```
+
+**Job flow:**
+1. Worker starts → auto-registers its real LAN IP + port with the backend.
+2. Worker sends a heartbeat to the backend every 30 seconds.
+3. Controller runs `submit_job.py` → queries backend for available workers → submits job → calls worker `/run` → prints result.
 
 ---
 
-## 3. Monorepo Directory Structure
+## 3. Directory Structure
 
 ```text
 distributed-compute/
+├── backend/
+│   ├── __init__.py
+│   ├── main.py           # FastAPI app: /register /heartbeat /submit /result /workers
+│   ├── config.py         # Backend settings (host, port, secret token)
+│   ├── models.py         # Pydantic request/response models
+│   ├── state.py          # In-memory worker registry and job store
+│   └── requirements.txt  # fastapi, uvicorn, pydantic-settings, httpx
 ├── worker/
-│   ├── worker.py             # Worker HTTP service (FastAPI / stdlib fallback)
-│   ├── config.py             # Host, Port, and Worker settings
-│   ├── requirements.txt      # Worker Python dependencies
+│   ├── worker.py         # Worker FastAPI service (stdlib fallback included)
+│   ├── config.py         # Worker settings (host, port, backend_url, backend_secret)
+│   ├── requirements.txt  # fastapi, uvicorn, pydantic-settings, httpx, psutil
 │   └── __init__.py
+├── scripts/
+│   ├── submit_job.py     # Controller CLI: submit a job via the backend
+│   └── test_milestone1.py# Milestone 1 ping/latency test
 ├── workloads/
 │   └── examples/
-│       ├── hello.py          # Minimal hello-world test
-│       └── cpu_test.py       # CPU stress test benchmark
-├── scripts/
-│   └── test_milestone1.py    # Controller ping and latency test script
-├── .env.example              # Sample configuration
+│       ├── hello.py      # Minimal hello-world workload
+│       └── cpu_test.py   # CPU stress test benchmark
+├── .env.example          # Sample configuration
 ├── .gitignore
 └── README.md
 ```
 
 ---
 
-## 4. Setup & Running Milestone 1
+## 4. Setup & Running
 
 ### Prerequisites
 - Python 3.12+ on both Laptop A and Laptop B.
 - Both laptops connected to the same Wi-Fi or LAN.
+- A shared secret token (default: `supersecret`) configured on both the backend and worker.
 
-### Step 1: On Laptop B (Worker)
-1. Install requirements (optional, fallback standard library mode also supported):
-   ```bash
-   pip install -r worker/requirements.txt
-   ```
-2. Start the worker node:
-   ```bash
-   python worker/worker.py
-   ```
-   *The startup banner will display the worker's detected LAN IP address.*
+---
 
-3. **Windows Firewall Rule (if blocked)**:
-   If Laptop A cannot connect, open PowerShell as Administrator on Laptop B and run:
-   ```powershell
-   New-NetFirewallRule -DisplayName "Distributed Compute Worker" -Direction Inbound -LocalPort 8001 -Protocol TCP -Action Allow
-   ```
+### Step 1: Start the Backend on Laptop A
 
-### Step 2: On Laptop A (Controller)
-1. Run the verification script pointing to Laptop B's IP:
-   ```bash
-   python scripts/test_milestone1.py --worker-url http://<LAPTOP_B_IP>:8001
-   ```
-2. Or use PowerShell directly:
-   ```powershell
-   Invoke-RestMethod -Uri "http://<LAPTOP_B_IP>:8001/"
-   ```
+```powershell
+cd distributed-compute
 
-### Expected Output
-```json
+# Activate virtual environment
+.\venv\Scripts\Activate.ps1
+
+# Install backend dependencies (once)
+pip install -r backend\requirements.txt
+
+# Set environment variables (optional – these are the defaults)
+$env:BACKEND_HOST   = "0.0.0.0"
+$env:BACKEND_PORT   = "8000"
+$env:BACKEND_SECRET = "supersecret"
+$env:BACKEND_LOG_LEVEL = "info"
+
+# Start the backend
+uvicorn backend.main:app `
+    --host $env:BACKEND_HOST `
+    --port $env:BACKEND_PORT `
+    --log-level $env:BACKEND_LOG_LEVEL
+```
+
+Expected output:
+```
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+> **Windows Firewall** – if workers on other machines can't reach port 8000, run this on Laptop A as Administrator:
+> ```powershell
+> New-NetFirewallRule -DisplayName "DC Backend" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+> ```
+
+---
+
+### Step 2: Start the Worker on Laptop B
+
+```powershell
+cd worker-project-root   # wherever you copied the worker folder
+
+# Activate virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install worker dependencies
+pip install -r worker\requirements.txt
+
+# Point the worker at Laptop A's backend
+$env:BACKEND_URL    = "http://<LAPTOP_A_IP>:8000"   # e.g. http://192.168.1.10:8000
+$env:BACKEND_SECRET = "supersecret"
+
+# Start the worker
+python worker\worker.py
+```
+
+Expected output on Laptop B:
+```
+===================================================================
+      PERSONAL DISTRIBUTED COMPUTE NETWORK - WORKER NODE
+===================================================================
+ Worker Hostname : DESKTOP-LEN
+ Listening Port  : 8001
+ Local IP(s)     : 172.20.10.5
+===================================================================
+INFO:worker Worker registered with ID: <uuid>
+INFO:     Uvicorn running on http://0.0.0.0:8001
+```
+
+Expected output on Laptop A backend console:
+```
+INFO:backend Worker registered: DESKTOP-LEN -> <uuid>
+INFO:backend Heartbeat received from <uuid>
+```
+
+> **Windows Firewall** on Laptop B (if blocked):
+> ```powershell
+> New-NetFirewallRule -DisplayName "DC Worker" -Direction Inbound -LocalPort 8001 -Protocol TCP -Action Allow
+> ```
+
+---
+
+### Step 3: Submit a Job from Laptop A
+
+```powershell
+# In a new PowerShell window on Laptop A (venv activated)
+cd distributed-compute
+
+python scripts\submit_job.py `
+    --command python `
+    --args -c "print('Hello from backend job')"
+```
+
+Expected output:
+```
+Using worker <uuid> at 172.20.10.5:8001
+Job submitted, id=<job-uuid>
+Worker execution result:
 {
-  "message": "Hello from worker",
-  "status": "online",
-  "hostname": "laptop-b",
-  "port": 8001,
-  "timestamp": "2026-09-14T08:30:00.000000+00:00",
-  "milestone": 1
+  "output": "Hello from backend job\r\n",
+  "error": "",
+  "returncode": 0
 }
 ```
 
 ---
 
-## 5. Development Milestones Roadmap
+## 5. Backend API Reference
 
-- [x] **Milestone 1**: Direct Worker Communication (`Laptop A -> Laptop B`)
-- [ ] **Milestone 2**: Central FastAPI Backend & Database
-- [ ] **Milestone 3**: Dynamic Worker Registration & `psutil` Heartbeats
-- [ ] **Milestone 4**: Job Lifecycle State Machine (`QUEUED` -> `RUNNING` -> `COMPLETED`)
-- [ ] **Milestone 5**: Sandboxed Docker Container Execution
-- [ ] **Milestone 6**: Hardware Constraints (CPU, Memory, Timeouts)
-- [ ] **Milestone 7**: Logs & Results Streaming
-- [ ] **Milestone 8**: Fault Tolerance & Dead Worker Detection
-- [ ] **Milestone 9**: Controller CLI Tool
+| Endpoint | Method | Auth | Payload | Response |
+|----------|--------|------|---------|----------|
+| `/register` | POST | ❌ None | `{worker_name, host, port}` | `{status, worker_id}` |
+| `/heartbeat` | POST | ❌ None | `{worker_id}` | `{status: "alive"}` |
+| `/submit` | POST | ✅ Bearer token | `{job_name, command, args}` | `{job_id, status}` |
+| `/result/{job_id}` | GET | ✅ Bearer token | – | `{job_id, status, output, error}` |
+| `/workers` | GET | ✅ Bearer token | – | `{worker_id: {...}}` |
+
+The auth token is set via `$env:BACKEND_SECRET` (default: `supersecret`).  
+Pass it as: `Authorization: Bearer supersecret`
+
+---
+
+## 6. Worker API Reference
+
+| Endpoint | Method | Payload | Response |
+|----------|--------|---------|----------|
+| `/` | GET | – | Worker status JSON |
+| `/health` | GET | – | `{status: "healthy"}` |
+| `/run` | POST | `{command, args}` | `{output, error, returncode}` |
+
+---
+
+## 7. Configuration
+
+### Backend (`backend/config.py`)
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `BACKEND_HOST` | `0.0.0.0` | Bind address |
+| `BACKEND_PORT` | `8000` | Listen port |
+| `BACKEND_SECRET` | `supersecret` | Shared auth token |
+| `BACKEND_LOG_LEVEL` | `INFO` | Logging verbosity |
+
+### Worker (`worker/config.py`)
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `WORKER_HOST` | `0.0.0.0` | Bind address |
+| `WORKER_PORT` | `8001` | Listen port |
+| `WORKER_NAME` | hostname | Display name |
+| `BACKEND_URL` | `http://127.0.0.1:8000` | Backend address |
+| `BACKEND_SECRET` | `supersecret` | Shared auth token |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+
+---
+
+## 8. Development Milestones Roadmap
+
+- [x] **Milestone 1**: Direct Worker Communication (`Laptop A → Laptop B`)
+  - Worker HTTP service with `/`, `/health`, `/run` endpoints
+  - LAN IP auto-detection and startup banner
+  - stdlib HTTP server fallback (no pip install needed)
+  - Controller ping/latency test script
+
+- [x] **Milestone 2**: Central Backend & Worker Registration
+  - FastAPI backend with `/register`, `/heartbeat`, `/submit`, `/result`, `/workers`
+  - Workers auto-register real LAN IP on startup
+  - 30-second heartbeat loop (background thread)
+  - `submit_job.py` controller CLI for end-to-end job dispatch
+  - Token-based auth on controller-facing endpoints
+
+- [ ] **Milestone 3**: Job Lifecycle State Machine (`QUEUED → RUNNING → COMPLETED`)
+- [ ] **Milestone 4**: Backend auto-dispatches to worker (no direct controller→worker call)
+- [ ] **Milestone 5**: Multiple workers + load balancing (round-robin / least-loaded)
+- [ ] **Milestone 6**: Sandboxed Docker Container Execution
+- [ ] **Milestone 7**: Hardware Constraints (CPU, Memory, Timeouts)
+- [ ] **Milestone 8**: Logs & Results Streaming
+- [ ] **Milestone 9**: Fault Tolerance & Dead Worker Detection
 - [ ] **Milestone 10**: Secure Cross-Internet Mesh (Tailscale/WireGuard)
