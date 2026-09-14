@@ -42,14 +42,15 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return token
 
 @app.post("/register", response_model=RegisterResponse)
-def register(req: RegisterRequest, token: str = Depends(verify_token)):
+def register(req: RegisterRequest):
     worker_id = str(uuid.uuid4())
     register_worker(worker_id, req.dict())
     logger.info(f"Worker registered: {req.worker_name} -> {worker_id}")
     return RegisterResponse(status="registered", worker_id=worker_id)
 
+
 @app.post("/heartbeat")
-def heartbeat(req: HeartbeatRequest, token: str = Depends(verify_token)):
+def heartbeat(req: HeartbeatRequest):
     if not get_worker(req.worker_id):
         raise HTTPException(status_code=404, detail="Worker not found")
     update_heartbeat(req.worker_id)

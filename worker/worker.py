@@ -250,15 +250,23 @@ try:
     def start_server():
         print_startup_banner()
 
+        # Auth header required by the backend
+        _auth_headers = {
+            "Authorization": f"Bearer {settings.backend_secret}",
+            "Content-Type": "application/json",
+        }
+
         # Register worker with backend and start heartbeat thread
         try:
+            _real_ip = get_local_ips()[0]  # actual LAN IP, not 0.0.0.0
             resp = httpx.post(
                 f"{settings.backend_url}/register",
                 json={
                     "worker_name": settings.worker_name,
-                    "host": settings.host,
+                    "host": _real_ip,
                     "port": settings.port,
                 },
+                headers=_auth_headers,
             )
 
             resp.raise_for_status()
@@ -275,23 +283,20 @@ try:
 
             if worker_id:
 
-                def _heartbeat_loop(wid):
+                def _heartbeat_loop(wid, hdrs):
 
                     while True:
 
                         try:
                             hb_resp = httpx.post(
                                 f"{settings.backend_url}/heartbeat",
-                                json={
-                                    "worker_id": wid
-                                },
+                                json={"worker_id": wid},
+                                headers=hdrs,
                             )
 
                             hb_resp.raise_for_status()
 
-                            logger.debug(
-                                "Heartbeat sent"
-                            )
+                            logger.debug("Heartbeat sent")
 
                         except Exception as e:
                             logger.error(
@@ -303,7 +308,7 @@ try:
 
                 threading.Thread(
                     target=_heartbeat_loop,
-                    args=(worker_id,),
+                    args=(worker_id, _auth_headers),
                     daemon=True,
                 ).start()
 

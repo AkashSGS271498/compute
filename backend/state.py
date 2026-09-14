@@ -1,5 +1,6 @@
 import threading
 from typing import Dict, Any
+from datetime import datetime, timezone
 
 _lock = threading.Lock()
 
@@ -8,16 +9,21 @@ _workers: Dict[str, Dict[str, Any]] = {}
 _jobs: Dict[str, Dict[str, Any]] = {}
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def register_worker(worker_id: str, data: Dict[str, Any]) -> None:
     with _lock:
         _workers[worker_id] = data
-        _workers[worker_id]["last_heartbeat"] = threading.Event()  # placeholder
+        _workers[worker_id]["last_heartbeat"] = _now()
 
 
 def update_heartbeat(worker_id: str) -> None:
     with _lock:
         if worker_id in _workers:
-            _workers[worker_id]["last_heartbeat"] = threading.Event()
+            _workers[worker_id]["last_heartbeat"] = _now()
+
 
 
 def get_worker(worker_id: str) -> Dict[str, Any] | None:
