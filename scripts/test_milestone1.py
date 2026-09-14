@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 
 
-def parse_url(url: str):
+def parse_url(url:  str):
     parsed = urllib.parse.urlparse(url)
     if not parsed.scheme:
         url = "http://" + url

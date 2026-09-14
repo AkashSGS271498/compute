@@ -81,8 +81,10 @@ def print_startup_banner():
 # Try FastAPI first; fallback to standard library http.server if dependencies are pending
 try:
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    import httpx
 
     app = FastAPI(
         title="Personal Distributed Compute - Worker",
@@ -108,6 +110,34 @@ try:
     def health_check():
         """Health check endpoint for liveness probes."""
         return {"status": "healthy", "worker": settings.worker_name}
+
+    @app.post("/run")
+    async def run_job(command: dict):
+        """
+        Execute a simple command payload.
+        Expected JSON: {"command": "python", "args": ["script.py"]}.
+        Returns stdout/stderr.
+        """
+        import subprocess, shlex, asyncio
+        cmd = command.get("command")
+        args = command.get("args", [])
+        if not cmd:
+            raise HTTPException(status_code=400, detail="Missing command")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cmd, *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return {
+                "output": stdout.decode(),
+                "error": stderr.decode(),
+                "returncode": proc.returncode,
+            }
+        except Exception as e:
+            logger.error(f"Job execution failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     def start_server():
         print_startup_banner()
