@@ -10,7 +10,8 @@ try:
         host: str = Field(default="0.0.0.0", alias="WORKER_HOST")
         port: int = Field(default=8001, alias="WORKER_PORT")
         worker_name: str = Field(default_factory=socket.gethostname, alias="WORKER_NAME")
-        log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+        backend_url: str = Field(default="http://127.0.0.1:8000", alias="BACKEND_URL")
+    backend_secret: str = Field(default="supersecret", alias="BACKEND_SECRET")
 
         class Config:
             env_file = ".env"

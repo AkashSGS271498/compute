@@ -85,6 +85,9 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     import httpx
+import threading
+import time
+import asyncio
 
     app = FastAPI(
         title="Personal Distributed Compute - Worker",
@@ -141,6 +144,30 @@ try:
 
     def start_server():
         print_startup_banner()
+        # Register worker with backend and start heartbeat thread
+        try:
+            resp = httpx.post(f"{settings.backend_url}/register", json={
+                "worker_name": settings.worker_name,
+                "host": settings.host,
+                "port": settings.port,
+            })
+            resp.raise_for_status()
+            worker_id = resp.json().get("worker_id")
+            logger.info(f"Worker registered with ID: {worker_id}")
+            if worker_id:
+                def _heartbeat_loop(wid):
+                    while True:
+                        try:
+                            hb_resp = httpx.post(f"{settings.backend_url}/heartbeat", json={"worker_id": wid})
+                            hb_resp.raise_for_status()
+                            logger.debug("Heartbeat sent")
+                        except Exception as e:
+                            logger.error(f"Heartbeat error: {e}")
+                        time.sleep(30)
+                threading.Thread(target=_heartbeat_loop, args=(worker_id,), daemon=True).start()
+        except Exception as e:
+            logger.error(f"Worker registration failed: {e}")
+        # Start the FastAPI server
         uvicorn.run(
             app,
             host=settings.host,
