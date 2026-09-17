@@ -17,7 +17,7 @@ Modern workflows often involve having multiple personal machines (e.g., Laptop A
 
 ## 2. Architecture
 
-### Milestone 2 – Central Backend + Worker Registration
+### Milestone 3 – Job System
 
 ```text
 +-----------------------------------------------+
@@ -26,10 +26,13 @@ Modern workflows often involve having multiple personal machines (e.g., Laptop A
 |   ┌─────────────────────────────────────┐      |
 |   │  Backend  (FastAPI :8000)           │      |
 |   │                                     │      |
-|   │  POST /register   ◄── Worker        │      |
-|   │  POST /heartbeat  ◄── Worker        │      |
-|   │  POST /submit     ◄── Controller    │      |
-|   │  GET  /workers    ◄── Controller    │      |
+|   │  POST /register        ◄── Worker   │      |
+|   │  POST /heartbeat       ◄── Worker   │      |
+|   │  POST /jobs            ◄── Ctrl     │      |
+|   │  GET  /jobs            ◄── Ctrl     │      |
+|   │  GET  /jobs/{id}       ◄── Ctrl     │      |
+|   │  POST /jobs/{id}/status◄── Worker   │      |
+|   │  GET  /workers         ◄── Ctrl     │      |
 |   └─────────────────────────────────────┘      |
 |                                                |
 |   scripts/submit_job.py  (Controller CLI)      |
@@ -43,9 +46,10 @@ Modern workflows often involve having multiple personal machines (e.g., Laptop A
 |   ┌─────────────────────────────────────┐      |
 |   │  Worker  (FastAPI/Uvicorn :8001)    │      |
 |   │                                     │      |
-|   │  POST /run     ◄── Backend dispatch │      |
-|   │  GET  /health  ◄── Liveness probe   │      |
-|   │  GET  /        ◄── Status           │      |
+|   │  POST /jobs/assign ◄── Backend      │      |
+|   │  POST /run         ◄── Legacy       │      |
+|   │  GET  /health      ◄── Liveness     │      |
+|   │  GET  /            ◄── Status       │      |
 |   └─────────────────────────────────────┘      |
 +-----------------------------------------------+
 ```
@@ -53,7 +57,8 @@ Modern workflows often involve having multiple personal machines (e.g., Laptop A
 **Job flow:**
 1. Worker starts → auto-registers its real LAN IP + port with the backend.
 2. Worker sends a heartbeat to the backend every 30 seconds.
-3. Controller runs `submit_job.py` → queries backend for available workers → submits job → calls worker `/run` → prints result.
+3. Controller submits a job via `POST /jobs` → Backend creates job (queued) → Scheduler finds an available worker → sends `POST /jobs/assign` to worker → worker accepts or rejects.
+4. Worker reports status changes back via `POST /jobs/{id}/status` (running → completed/failed).
 
 ---
 
@@ -63,24 +68,40 @@ Modern workflows often involve having multiple personal machines (e.g., Laptop A
 distributed-compute/
 ├── backend/
 │   ├── __init__.py
-│   ├── main.py           # FastAPI app: /register /heartbeat /submit /result /workers
-│   ├── config.py         # Backend settings (host, port, secret token)
+│   ├── main.py           # FastAPI app: /register /heartbeat /jobs /workers
+│   ├── config.py         # Backend settings
 │   ├── models.py         # Pydantic request/response models
 │   ├── state.py          # In-memory worker registry and job store
-│   └── requirements.txt  # fastapi, uvicorn, pydantic-settings, httpx
+│   ├── services/
+│   │   ├── job_manager.py # Job creation, state machine, transitions
+│   │   └── scheduler.py   # Worker selection and job assignment
+│   └── requirements.txt
 ├── worker/
-│   ├── worker.py         # Worker FastAPI service (stdlib fallback included)
-│   ├── config.py         # Worker settings (host, port, backend_url, backend_secret)
-│   ├── requirements.txt  # fastapi, uvicorn, pydantic-settings, httpx, psutil
+│   ├── worker.py         # Worker FastAPI service + Docker execution
+│   ├── config.py         # Worker settings incl. Docker config
+│   ├── execution/
+│   │   ├── __init__.py
+│   │   ├── base.py       # Abstract ExecutionEngine + ExecutionResult
+│   │   └── docker.py     # DockerExecutionEngine
+│   ├── requirements.txt
 │   └── __init__.py
-├── scripts/
-│   ├── submit_job.py     # Controller CLI: submit a job via the backend
-│   └── test_milestone1.py# Milestone 1 ping/latency test
 ├── workloads/
+│   ├── python/
+│   │   └── Dockerfile    # Trusted Python workload image
 │   └── examples/
-│       ├── hello.py      # Minimal hello-world workload
-│       └── cpu_test.py   # CPU stress test benchmark
-├── .env.example          # Sample configuration
+│       ├── hello.py
+│       ├── calculation.py
+│       ├── failure.py
+│       └── timeout.py
+├── scripts/
+│   ├── submit_job.py     # Controller CLI
+│   └── test_milestone1.py
+├── tests/
+│   ├── verify_milestone_3.py
+│   └── verify_milestone_4.py
+├── docs/
+│   └── architecture.md
+├── .env.example
 ├── .gitignore
 └── README.md
 ```
@@ -93,6 +114,16 @@ distributed-compute/
 - Python 3.12+ on both Laptop A and Laptop B.
 - Both laptops connected to the same Wi-Fi or LAN.
 - A shared secret token (default: `supersecret`) configured on both the backend and worker.
+- **Docker Desktop** installed and running on the worker machine (Milestone 4+).
+
+---
+
+### Step 0: Build the Docker Workload Image (Worker Machine)
+
+```powershell
+cd distributed-compute
+docker build -t distributed-compute-python:latest workloads/python/
+```
 
 ---
 
@@ -209,9 +240,11 @@ Worker execution result:
 |----------|--------|------|---------|----------|
 | `/register` | POST | ❌ None | `{worker_name, host, port}` | `{status, worker_id}` |
 | `/heartbeat` | POST | ❌ None | `{worker_id}` | `{status: "alive"}` |
-| `/submit` | POST | ✅ Bearer token | `{job_name, command, args}` | `{job_id, status}` |
-| `/result/{job_id}` | GET | ✅ Bearer token | – | `{job_id, status, output, error}` |
-| `/workers` | GET | ✅ Bearer token | – | `{worker_id: {...}}` |
+| `/jobs` | POST | ✅ Bearer | `{payload: {...}}` | `{job_id, status, payload, ...}` |
+| `/jobs` | GET | ✅ Bearer | – | `{jobs: [...]}` |
+| `/jobs/{job_id}` | GET | ✅ Bearer | – | `{job_id, status, worker_id, ...}` |
+| `/jobs/{job_id}/status` | POST | ❌ None | `{status, error?}` | `{status: "success"}` |
+| `/workers` | GET | ✅ Bearer | – | `{worker_id: {...}}` |
 
 The auth token is set via `$env:BACKEND_SECRET` (default: `supersecret`).  
 Pass it as: `Authorization: Bearer supersecret`
@@ -224,6 +257,7 @@ Pass it as: `Authorization: Bearer supersecret`
 |----------|--------|---------|----------|
 | `/` | GET | – | Worker status JSON |
 | `/health` | GET | – | `{status: "healthy"}` |
+| `/jobs/assign` | POST | `{job_id, payload}` | `{job_id, status: "accepted"/"rejected"}` |
 | `/run` | POST | `{command, args}` | `{output, error, returncode}` |
 
 ---
@@ -249,29 +283,40 @@ Pass it as: `Authorization: Bearer supersecret`
 | `BACKEND_URL` | `http://127.0.0.1:8000` | Backend address |
 | `BACKEND_SECRET` | `supersecret` | Shared auth token |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `DOCKER_IMAGE` | `distributed-compute-python:latest` | Trusted workload image |
+| `JOB_CPU_LIMIT` | `1.0` | Max CPUs per container |
+| `JOB_MEMORY_LIMIT` | `512m` | Max memory per container |
+| `JOB_TIMEOUT_SECONDS` | `30` | Kill container after N seconds |
+| `JOB_NETWORK_DISABLED` | `true` | Disable network in container |
 
 ---
 
-## 8. Development Milestones Roadmap
+## 8. Security
 
-- [x] **Milestone 1**: Direct Worker Communication (`Laptop A → Laptop B`)
-  - Worker HTTP service with `/`, `/health`, `/run` endpoints
-  - LAN IP auto-detection and startup banner
-  - stdlib HTTP server fallback (no pip install needed)
-  - Controller ping/latency test script
+- Workloads execute inside Docker containers, never on the host
+- Only the configured trusted image is used (job payload cannot override)
+- Containers run as non-root with all capabilities dropped
+- Network disabled by default
+- Code mounted read-only from a per-job temp directory
+- Containers and temp files always cleaned up (even on failure/timeout)
+- No `eval()`, `exec()`, `shell=True`, or `docker.sock` exposure
 
+> **Limitation**: Docker provides process/filesystem isolation, not a perfect security sandbox. A kernel exploit could theoretically escape. For production with untrusted code, consider gVisor or Firecracker.
+
+---
+
+## 9. Development Milestones Roadmap
+
+- [x] **Milestone 1**: Direct Worker Communication
 - [x] **Milestone 2**: Central Backend & Worker Registration
-  - FastAPI backend with `/register`, `/heartbeat`, `/submit`, `/result`, `/workers`
-  - Workers auto-register real LAN IP on startup
-  - 30-second heartbeat loop (background thread)
-  - `submit_job.py` controller CLI for end-to-end job dispatch
-  - Token-based auth on controller-facing endpoints
-
-- [ ] **Milestone 3**: Job Lifecycle State Machine (`QUEUED → RUNNING → COMPLETED`)
-- [ ] **Milestone 4**: Backend auto-dispatches to worker (no direct controller→worker call)
-- [ ] **Milestone 5**: Multiple workers + load balancing (round-robin / least-loaded)
-- [ ] **Milestone 6**: Sandboxed Docker Container Execution
-- [ ] **Milestone 7**: Hardware Constraints (CPU, Memory, Timeouts)
-- [ ] **Milestone 8**: Logs & Results Streaming
-- [ ] **Milestone 9**: Fault Tolerance & Dead Worker Detection
-- [ ] **Milestone 10**: Secure Cross-Internet Mesh (Tailscale/WireGuard)
+- [x] **Milestone 3**: Job System (state machine, scheduling, assignment)
+- [x] **Milestone 4**: Docker-Based Workload Execution
+  - Workloads execute in Docker containers
+  - CPU, memory, timeout limits enforced
+  - stdout/stderr/exit_code captured and returned
+  - Network disabled, non-root, capabilities dropped
+  - Automatic container and temp file cleanup
+- [ ] **Milestone 5**: Multiple workers + load balancing
+- [ ] **Milestone 6**: Logs & Results Streaming
+- [ ] **Milestone 7**: Fault Tolerance & Dead Worker Detection
+- [ ] **Milestone 8**: Secure Cross-Internet Mesh (Tailscale/WireGuard)

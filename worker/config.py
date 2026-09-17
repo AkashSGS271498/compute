@@ -36,6 +36,32 @@ try:
             alias="LOG_LEVEL",
         )
 
+        # Docker execution settings
+        docker_image: str = Field(
+            default="distributed-compute-python:latest",
+            alias="DOCKER_IMAGE",
+        )
+
+        job_cpu_limit: float = Field(
+            default=1.0,
+            alias="JOB_CPU_LIMIT",
+        )
+
+        job_memory_limit: str = Field(
+            default="512m",
+            alias="JOB_MEMORY_LIMIT",
+        )
+
+        job_timeout_seconds: int = Field(
+            default=30,
+            alias="JOB_TIMEOUT_SECONDS",
+        )
+
+        job_network_disabled: bool = Field(
+            default=True,
+            alias="JOB_NETWORK_DISABLED",
+        )
+
         class Config:
             env_file = ".env"
             env_file_encoding = "utf-8"
@@ -83,6 +109,32 @@ except ImportError:
                 "LOG_LEVEL",
                 "INFO",
             )
+
+            # Docker execution settings
+            self.docker_image = os.getenv(
+                "DOCKER_IMAGE",
+                "distributed-compute-python:latest",
+            )
+
+            self.job_cpu_limit = float(os.getenv(
+                "JOB_CPU_LIMIT",
+                "1.0",
+            ))
+
+            self.job_memory_limit = os.getenv(
+                "JOB_MEMORY_LIMIT",
+                "512m",
+            )
+
+            self.job_timeout_seconds = int(os.getenv(
+                "JOB_TIMEOUT_SECONDS",
+                "30",
+            ))
+
+            self.job_network_disabled = os.getenv(
+                "JOB_NETWORK_DISABLED",
+                "true",
+            ).lower() in ("true", "1", "yes")
 
 
     settings = SimpleSettings()

@@ -163,6 +163,14 @@ try:
 
 
     # -----------------------------------------------------
+    # Global State
+    # -----------------------------------------------------
+    
+    WORKER_STATE = {
+        "current_job_id": None
+    }
+
+    # -----------------------------------------------------
     # Root endpoint
     # -----------------------------------------------------
 
@@ -188,6 +196,132 @@ try:
             "worker": settings.worker_name,
         }
 
+    # -----------------------------------------------------
+    # Docker Execution Engine
+    # -----------------------------------------------------
+
+    from worker.execution.docker import DockerExecutionEngine
+
+    _engine = DockerExecutionEngine(
+        image=settings.docker_image,
+        cpu_limit=settings.job_cpu_limit,
+        memory_limit=settings.job_memory_limit,
+        timeout_seconds=settings.job_timeout_seconds,
+        network_disabled=settings.job_network_disabled,
+    )
+
+    # Check Docker availability on startup
+    logger.info("[DOCKER] Checking Docker availability...")
+    if _engine.is_available():
+        logger.info("[DOCKER] Docker available")
+    else:
+        logger.error("[DOCKER] Docker is unavailable — job execution will fail")
+
+    # -----------------------------------------------------
+    # Background job execution
+    # -----------------------------------------------------
+
+    def _execute_job_background(job_id: str, payload: dict):
+        """Run the workload in Docker and report results to backend."""
+        _auth_headers = {
+            "Authorization": f"Bearer {settings.backend_secret}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            # Report RUNNING
+            httpx.post(
+                f"{settings.backend_url}/jobs/{job_id}/status",
+                json={"status": "running"},
+                headers=_auth_headers,
+            )
+
+            # Execute in Docker
+            result = _engine.execute(job_id, payload)
+
+            # Report result
+            if result.success:
+                httpx.post(
+                    f"{settings.backend_url}/jobs/{job_id}/status",
+                    json={
+                        "status": "completed",
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "exit_code": result.exit_code,
+                    },
+                    headers=_auth_headers,
+                )
+            else:
+                httpx.post(
+                    f"{settings.backend_url}/jobs/{job_id}/status",
+                    json={
+                        "status": "failed",
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "exit_code": result.exit_code,
+                        "error": result.error or "Workload failed",
+                    },
+                    headers=_auth_headers,
+                )
+
+        except Exception as e:
+            logger.error(f"Job execution error for {job_id}: {e}")
+            try:
+                httpx.post(
+                    f"{settings.backend_url}/jobs/{job_id}/status",
+                    json={
+                        "status": "failed",
+                        "error": str(e),
+                    },
+                    headers=_auth_headers,
+                )
+            except Exception:
+                pass
+
+        finally:
+            WORKER_STATE["current_job_id"] = None
+            logger.info(f"Worker available again (job {job_id} finished)")
+
+    # -----------------------------------------------------
+    # Assign job endpoint
+    # -----------------------------------------------------
+
+    @app.post("/jobs/assign")
+    def assign_job(req: dict):
+        job_id = req.get("job_id")
+        payload = req.get("payload", {})
+
+        if not job_id:
+            raise HTTPException(status_code=400, detail="Missing job_id")
+            
+        if WORKER_STATE["current_job_id"] is not None:
+            return {
+                "job_id": job_id,
+                "status": "rejected",
+                "reason": "worker_busy"
+            }
+            
+        WORKER_STATE["current_job_id"] = job_id
+        logger.info(f"Accepted job: {job_id}")
+
+        # Spawn background execution thread (non-blocking)
+        threading.Thread(
+            target=_execute_job_background,
+            args=(job_id, payload),
+            daemon=True,
+        ).start()
+        
+        return {
+            "job_id": job_id,
+            "status": "accepted",
+            "worker_id": settings.worker_name
+        }
+
+    @app.post("/jobs/clear")
+    def clear_job():
+        # Used by tests to clear worker state
+        WORKER_STATE["current_job_id"] = None
+        return {"status": "cleared"}
 
     # -----------------------------------------------------
     # Run job endpoint
