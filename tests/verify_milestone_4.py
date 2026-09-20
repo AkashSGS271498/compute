@@ -165,19 +165,71 @@ def test_failure():
 # ------------------------------------------------------------------
 # TEST 7 — Timeout
 # ------------------------------------------------------------------
+def _is_timeout_error(error_str: str) -> bool:
+    """
+    Robustly check whether an error string indicates a timeout.
+
+    Handles both "timeout" and "timed out" phrasings so that
+    slight wording differences in the execution engine do not
+    cause false failures.
+    """
+    s = (error_str or "").lower()
+    return "timeout" in s or "timed out" in s
+
+
 def test_timeout():
     print_step("7: Testing timeout")
     code = "import time\ntime.sleep(60)"
-    # Use a short timeout — the worker's configured timeout will handle it
+
+    # Submit the job and wait up to 60 s for the worker's built-in
+    # timeout to fire (default 30 s).  We do NOT rely on the test
+    # harness to kill the job — the real Docker timeout mechanism
+    # must do it.
     result = submit_and_wait({"type": "python", "code": code}, timeout=60)
     if not result:
         fail("Job submission failed")
         return
 
-    if result["status"] == "failed" and "timeout" in (result.get("error") or "").lower():
-        ok("Timeout correctly detected")
-    else:
-        fail(f"Status={result['status']}, error={result.get('error')}")
+    error_text = result.get("error") or ""
+
+    # ── 1. Job must have failed because of a timeout ─────────────
+    if result["status"] != "failed" or not _is_timeout_error(error_text):
+        fail(f"Status={result['status']}, error={error_text}")
+        return
+
+    # ── 2. Verify the container was cleaned up ───────────────────
+    try:
+        client = docker.from_env()
+        leftovers = client.containers.list(
+            all=True, filters={"name": "compute-job-"}
+        )
+        if leftovers:
+            fail(
+                f"Timeout occurred but {len(leftovers)} container(s) still "
+                f"exist: {[c.name for c in leftovers]}"
+            )
+            return
+    except Exception as e:
+        fail(f"Docker error while checking cleanup: {e}")
+        return
+
+    # ── 3. Worker must recover and accept a new job ───────────────
+    # Give the worker a moment to reset its state after the timeout.
+    time.sleep(2)
+    recovery = submit_and_wait(
+        {"type": "python", "code": "print(2 + 3)"}, timeout=45
+    )
+    if not recovery:
+        fail("Worker recovery job submission failed after timeout")
+        return
+    if recovery["status"] != "completed" or "5" not in (recovery.get("stdout") or ""):
+        fail(
+            f"Worker did not recover after timeout — "
+            f"status={recovery['status']}, stdout={recovery.get('stdout')}"
+        )
+        return
+
+    ok("Timeout correctly detected, container cleaned up, worker recovered")
 
 
 # ------------------------------------------------------------------

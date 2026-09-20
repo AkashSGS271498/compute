@@ -1,7 +1,8 @@
+import base64
 import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
-from backend.state import add_job, get_job, list_jobs, update_job
+from backend.state import add_job, get_job, list_jobs, update_job, store_output_file
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -18,6 +19,7 @@ def create_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         "started_at": None,
         "completed_at": None,
         "error": None,
+        "outputs": None,
     }
     add_job(job_id, job_data)
     return job_data
@@ -35,6 +37,7 @@ def update_job_status(
     stdout: Optional[str] = None,
     stderr: Optional[str] = None,
     exit_code: Optional[int] = None,
+    output_files: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     job = get_job(job_id)
     if not job:
@@ -74,7 +77,22 @@ def update_job_status(
         update_data["stderr"] = stderr
     if exit_code is not None:
         update_data["exit_code"] = exit_code
-            
+
+    # Handle output files: decode bytes → store, save metadata in job record
+    if output_files:
+        metadata = []
+        for entry in output_files:
+            filename = entry.get("filename", "")
+            content_b64 = entry.get("content_b64", "")
+            size = entry.get("size", 0)
+            try:
+                raw_bytes = base64.b64decode(content_b64)
+                store_output_file(job_id, filename, raw_bytes)
+                metadata.append({"filename": filename, "size": size})
+            except Exception:
+                pass  # Skip malformed entries
+        if metadata:
+            update_data["outputs"] = metadata
+
     update_job(job_id, update_data)
     return True
-

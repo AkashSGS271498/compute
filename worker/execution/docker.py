@@ -1,15 +1,17 @@
-"""Docker-based execution engine for running workloads in containers."""
+﻿"""Docker-based execution engine for running workloads in containers."""
 
+import base64
 import logging
 import os
 import shutil
 import tempfile
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import docker
 from docker.errors import DockerException, ImageNotFound, APIError
 
 from worker.execution.base import ExecutionEngine, ExecutionResult
+from worker.file_utils import validate_filename, safe_join
 
 logger = logging.getLogger("worker.docker")
 
@@ -20,16 +22,24 @@ class DockerExecutionEngine(ExecutionEngine):
 
     Security:
     - Only uses a trusted, pre-built image (configured via settings).
-    - Workload code is written to a temp dir and bind-mounted read-only.
+    - Workload code is written to an isolated job workspace.
+    - Input files are bind-mounted read-only at /workspace/input.
+    - Output files are bind-mounted read-write at /workspace/output.
     - No privileged mode, no host network, no docker.sock exposure.
     - CPU, memory, and timeout limits enforced.
     - Network disabled by default.
-    - Container and temp files always cleaned up.
+    - Container and entire job workspace always cleaned up.
 
-    Limitations:
-    - Docker is an isolation boundary, not a perfect security sandbox.
-      A determined attacker with a kernel exploit could escape.
-    - Only supports "python" workload type for now.
+    Workspace layout (on the host):
+        <tmp>/dc-job-<job_id[:8]>/
+            script.py        <- workload code (RO mounted)
+            input/           <- decoded input files (RO mounted)
+            output/          <- written by container (RW mounted)
+
+    Container sees:
+        /workspace/script.py
+        /workspace/input/<files>
+        /workspace/output/        (writable)
     """
 
     def __init__(
@@ -39,12 +49,22 @@ class DockerExecutionEngine(ExecutionEngine):
         memory_limit: str = "512m",
         timeout_seconds: int = 30,
         network_disabled: bool = True,
+        max_input_file_bytes: int = 10 * 1024 * 1024,
+        max_total_input_bytes: int = 50 * 1024 * 1024,
+        max_output_file_bytes: int = 50 * 1024 * 1024,
+        max_output_files: int = 50,
+        max_input_files: int = 20,
     ):
         self.image = image
         self.cpu_limit = cpu_limit
         self.memory_limit = memory_limit
         self.timeout_seconds = timeout_seconds
         self.network_disabled = network_disabled
+        self.max_input_file_bytes = max_input_file_bytes
+        self.max_total_input_bytes = max_total_input_bytes
+        self.max_output_file_bytes = max_output_file_bytes
+        self.max_output_files = max_output_files
+        self.max_input_files = max_input_files
         self._client = None
 
     def _get_client(self) -> docker.DockerClient:
@@ -76,22 +96,29 @@ class DockerExecutionEngine(ExecutionEngine):
         except DockerException:
             return False
 
+    # ------------------------------------------------------------------
+    # Public execute()
+    # ------------------------------------------------------------------
+
     def execute(self, job_id: str, payload: Dict[str, Any]) -> ExecutionResult:
         """
         Execute a Python workload inside a Docker container.
 
         Args:
-            job_id: Unique job identifier.
-            payload: Must contain {"type": "python", "code": "<python code>"}.
+            job_id:  Unique job identifier.
+            payload: Must contain:
+                       {"type": "python", "code": "<python code>"}
+                     May optionally contain:
+                       {"inputs": {"filename": "<base64>", ...}}
 
         Returns:
-            ExecutionResult with stdout, stderr, exit_code, error.
+            ExecutionResult with stdout, stderr, exit_code, error,
+            and output_files.
         """
-        # ----------------------------------------------------------
-        # 1. Validate payload
-        # ----------------------------------------------------------
+        # 1. Validate payload ──────────────────────────────────────
         workload_type = payload.get("type")
         code = payload.get("code")
+        inputs: Dict[str, str] = payload.get("inputs") or {}
 
         if workload_type != "python":
             return ExecutionResult(
@@ -101,65 +128,123 @@ class DockerExecutionEngine(ExecutionEngine):
         if not isinstance(code, str) or not code.strip():
             return ExecutionResult(error="Code must be a non-empty string")
 
-        # ----------------------------------------------------------
-        # 2. Create temp directory and write script
-        # ----------------------------------------------------------
-        tmp_dir = None
+        # 2. Validate input file metadata ──────────────────────────
+        if not isinstance(inputs, dict):
+            return ExecutionResult(error="'inputs' must be a filename→base64 dict")
+
+        if len(inputs) > self.max_input_files:
+            return ExecutionResult(
+                error=f"Too many input files: {len(inputs)} > {self.max_input_files}"
+            )
+
+        # 3. Set up isolated job workspace ─────────────────────────
+        job_dir = None
         container = None
         container_name = f"compute-job-{job_id[:8]}"
 
         try:
-            tmp_dir = tempfile.mkdtemp(prefix=f"dc-job-{job_id[:8]}-")
-            script_path = os.path.join(tmp_dir, "script.py")
+            job_dir = tempfile.mkdtemp(prefix=f"dc-job-{job_id[:8]}-")
+            input_dir = os.path.join(job_dir, "input")
+            output_dir = os.path.join(job_dir, "output")
+            script_path = os.path.join(job_dir, "script.py")
 
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Write code
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(code)
 
+            # 4. Decode and write input files ──────────────────────
+            total_bytes = 0
+            for filename, b64_content in inputs.items():
+                safe_name = validate_filename(filename)
+                if safe_name is None:
+                    return ExecutionResult(
+                        error=f"Rejected input filename: {filename!r}"
+                    )
+
+                try:
+                    file_bytes = base64.b64decode(b64_content)
+                except Exception:
+                    return ExecutionResult(
+                        error=f"Invalid base64 for input file: {filename!r}"
+                    )
+
+                if len(file_bytes) > self.max_input_file_bytes:
+                    return ExecutionResult(
+                        error=f"Input file {filename!r} exceeds size limit "
+                              f"({len(file_bytes)} > {self.max_input_file_bytes} bytes)"
+                    )
+
+                total_bytes += len(file_bytes)
+                if total_bytes > self.max_total_input_bytes:
+                    return ExecutionResult(
+                        error=f"Total input size exceeds limit "
+                              f"({total_bytes} > {self.max_total_input_bytes} bytes)"
+                    )
+
+                dest = safe_join(input_dir, safe_name)
+                if dest is None:
+                    return ExecutionResult(
+                        error=f"Path traversal detected for input file: {filename!r}"
+                    )
+
+                with open(dest, "wb") as f:
+                    f.write(file_bytes)
+
             logger.info(f"[DOCKER] Starting job: {job_id}")
             logger.info(f"[DOCKER] Image: {self.image}")
-            logger.info(f"[DOCKER] CPU limit: {self.cpu_limit}")
-            logger.info(f"[DOCKER] Memory limit: {self.memory_limit}")
             logger.info(f"[DOCKER] Timeout: {self.timeout_seconds}s")
-            logger.info(f"[DOCKER] Network disabled: {self.network_disabled}")
+            logger.info(f"[DOCKER] Input files: {list(inputs.keys())}")
 
-            # ----------------------------------------------------------
-            # 3. Create and start container
-            # ----------------------------------------------------------
-            client = self._get_client()
-
-            # Convert tmp_dir to a Docker-compatible path on Windows
+            # 5. Build Docker volume mounts ────────────────────────
             # Docker Desktop on Windows needs forward slashes
-            host_path = tmp_dir.replace("\\", "/")
+            def _docker_path(p: str) -> str:
+                return p.replace("\\", "/")
+
+            volumes = {
+                _docker_path(script_path): {
+                    "bind": "/workspace/script.py",
+                    "mode": "ro",
+                },
+                _docker_path(input_dir): {
+                    "bind": "/workspace/input",
+                    "mode": "ro",
+                },
+                _docker_path(output_dir): {
+                    "bind": "/workspace/output",
+                    "mode": "rw",
+                },
+            }
+
+            # 6. Create and start container ────────────────────────
+            client = self._get_client()
 
             container = client.containers.run(
                 image=self.image,
                 command=["python", "/workspace/script.py"],
                 name=container_name,
                 detach=True,
-                # Security: read-only mount, no privileged, no extra caps
-                volumes={host_path: {"bind": "/workspace", "mode": "ro"}},
+                volumes=volumes,
                 privileged=False,
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges"],
-                # Resource limits
                 nano_cpus=int(self.cpu_limit * 1e9),
                 mem_limit=self.memory_limit,
-                # Network
                 network_disabled=self.network_disabled,
-                # Cleanup
-                auto_remove=False,  # we remove manually after collecting logs
+                auto_remove=False,
             )
 
             logger.info(f"[DOCKER] Container started: {container_name}")
 
-            # ----------------------------------------------------------
-            # 4. Wait for completion with timeout
-            # ----------------------------------------------------------
+            # 7. Wait for completion with timeout ──────────────────
+            timed_out = False
             try:
-                result = container.wait(timeout=self.timeout_seconds)
-                exit_code = result.get("StatusCode", -1)
+                wait_result = container.wait(timeout=self.timeout_seconds)
+                exit_code = wait_result.get("StatusCode", -1)
             except Exception:
-                # Timeout or other wait error
+                timed_out = True
                 logger.warning(
                     f"[DOCKER] Job {job_id} timed out after {self.timeout_seconds}s"
                 )
@@ -167,27 +252,32 @@ class DockerExecutionEngine(ExecutionEngine):
                     container.kill()
                 except Exception:
                     pass
-                return ExecutionResult(
-                    stdout=self._safe_logs(container, stdout=True, stderr=False),
-                    stderr=self._safe_logs(container, stdout=False, stderr=True),
-                    exit_code=-1,
-                    error=f"Job timed out after {self.timeout_seconds} seconds",
-                )
 
-            # ----------------------------------------------------------
-            # 5. Capture output
-            # ----------------------------------------------------------
+            # 8. Collect stdout/stderr ─────────────────────────────
             stdout = self._safe_logs(container, stdout=True, stderr=False)
             stderr = self._safe_logs(container, stdout=False, stderr=True)
 
-            logger.info(f"[DOCKER] Execution finished")
+            if timed_out:
+                return ExecutionResult(
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=-1,
+                    error=f"Job timed out after {self.timeout_seconds} seconds",
+                    output_files=self._collect_outputs(output_dir),
+                )
+
+            # 9. Collect output files ──────────────────────────────
+            output_files = self._collect_outputs(output_dir)
+
             logger.info(f"[DOCKER] Exit code: {exit_code}")
+            logger.info(f"[DOCKER] Output files: {[f['filename'] for f in output_files]}")
 
             if exit_code == 0:
                 return ExecutionResult(
                     stdout=stdout,
                     stderr=stderr,
                     exit_code=exit_code,
+                    output_files=output_files,
                 )
             else:
                 return ExecutionResult(
@@ -195,6 +285,7 @@ class DockerExecutionEngine(ExecutionEngine):
                     stderr=stderr,
                     exit_code=exit_code,
                     error="Workload failed",
+                    output_files=output_files,
                 )
 
         except ImageNotFound:
@@ -218,9 +309,7 @@ class DockerExecutionEngine(ExecutionEngine):
             return ExecutionResult(error=msg)
 
         finally:
-            # ----------------------------------------------------------
-            # 6. Always clean up container
-            # ----------------------------------------------------------
+            # 10. Always remove container ──────────────────────────
             if container is not None:
                 try:
                     container.remove(force=True)
@@ -230,17 +319,77 @@ class DockerExecutionEngine(ExecutionEngine):
                         f"[DOCKER] Failed to remove container {container_name}: {e}"
                     )
 
-            # ----------------------------------------------------------
-            # 7. Always clean up temp files
-            # ----------------------------------------------------------
-            if tmp_dir and os.path.exists(tmp_dir):
+            # 11. Always remove entire job workspace ───────────────
+            if job_dir and os.path.exists(job_dir):
                 try:
-                    shutil.rmtree(tmp_dir)
-                    logger.debug(f"[DOCKER] Temp dir removed: {tmp_dir}")
+                    shutil.rmtree(job_dir)
+                    logger.debug(f"[DOCKER] Job workspace removed: {job_dir}")
                 except Exception as e:
                     logger.warning(
-                        f"[DOCKER] Failed to remove temp dir {tmp_dir}: {e}"
+                        f"[DOCKER] Failed to remove workspace {job_dir}: {e}"
                     )
+
+    # ------------------------------------------------------------------
+    # Output collection
+    # ------------------------------------------------------------------
+
+    def _collect_outputs(self, output_dir: str) -> List[Dict[str, Any]]:
+        """
+        Walk *output_dir*, read each file, and return a list of
+        {"filename": str, "content_b64": str, "size": int} dicts.
+
+        Files that exceed *max_output_file_bytes* are skipped with a
+        warning. If more than *max_output_files* files exist, only the
+        first N are returned (alphabetical order).
+        """
+        results = []
+
+        try:
+            entries = sorted(os.listdir(output_dir))
+        except OSError:
+            return results
+
+        for name in entries:
+            if len(results) >= self.max_output_files:
+                logger.warning(
+                    f"[DOCKER] Output file limit ({self.max_output_files}) reached; "
+                    f"skipping remaining files"
+                )
+                break
+
+            safe_name = validate_filename(name)
+            if safe_name is None:
+                logger.warning(f"[DOCKER] Skipping unsafe output filename: {name!r}")
+                continue
+
+            full_path = safe_join(output_dir, safe_name)
+            if full_path is None or not os.path.isfile(full_path):
+                continue
+
+            file_size = os.path.getsize(full_path)
+            if file_size > self.max_output_file_bytes:
+                logger.warning(
+                    f"[DOCKER] Output file {name!r} too large "
+                    f"({file_size} > {self.max_output_file_bytes}); skipping"
+                )
+                continue
+
+            try:
+                with open(full_path, "rb") as f:
+                    content = f.read()
+                results.append({
+                    "filename": safe_name,
+                    "content_b64": base64.b64encode(content).decode("ascii"),
+                    "size": file_size,
+                })
+            except OSError as e:
+                logger.warning(f"[DOCKER] Could not read output file {name!r}: {e}")
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _safe_logs(

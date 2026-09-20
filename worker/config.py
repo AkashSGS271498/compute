@@ -62,6 +62,32 @@ try:
             alias="JOB_NETWORK_DISABLED",
         )
 
+        # File transfer limits
+        max_input_file_bytes: int = Field(
+            default=10 * 1024 * 1024,  # 10 MB
+            alias="MAX_INPUT_FILE_BYTES",
+        )
+
+        max_total_input_bytes: int = Field(
+            default=50 * 1024 * 1024,  # 50 MB
+            alias="MAX_TOTAL_INPUT_BYTES",
+        )
+
+        max_output_file_bytes: int = Field(
+            default=50 * 1024 * 1024,  # 50 MB
+            alias="MAX_OUTPUT_FILE_BYTES",
+        )
+
+        max_output_files: int = Field(
+            default=50,
+            alias="MAX_OUTPUT_FILES",
+        )
+
+        max_input_files: int = Field(
+            default=20,
+            alias="MAX_INPUT_FILES",
+        )
+
         class Config:
             env_file = ".env"
             env_file_encoding = "utf-8"
@@ -135,6 +161,32 @@ except ImportError:
                 "JOB_NETWORK_DISABLED",
                 "true",
             ).lower() in ("true", "1", "yes")
+
+            # File transfer limits
+            self.max_input_file_bytes = int(os.getenv(
+                "MAX_INPUT_FILE_BYTES",
+                str(10 * 1024 * 1024),
+            ))
+
+            self.max_total_input_bytes = int(os.getenv(
+                "MAX_TOTAL_INPUT_BYTES",
+                str(50 * 1024 * 1024),
+            ))
+
+            self.max_output_file_bytes = int(os.getenv(
+                "MAX_OUTPUT_FILE_BYTES",
+                str(50 * 1024 * 1024),
+            ))
+
+            self.max_output_files = int(os.getenv(
+                "MAX_OUTPUT_FILES",
+                "50",
+            ))
+
+            self.max_input_files = int(os.getenv(
+                "MAX_INPUT_FILES",
+                "20",
+            ))
 
 
     settings = SimpleSettings()

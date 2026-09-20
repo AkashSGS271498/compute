@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 @dataclass
@@ -12,6 +12,8 @@ class ExecutionResult:
     stderr: str = ""
     exit_code: int = -1
     error: Optional[str] = None
+    # Each entry: {"filename": str, "content_b64": str, "size": int}
+    output_files: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def success(self) -> bool:

@@ -208,6 +208,11 @@ try:
         memory_limit=settings.job_memory_limit,
         timeout_seconds=settings.job_timeout_seconds,
         network_disabled=settings.job_network_disabled,
+        max_input_file_bytes=settings.max_input_file_bytes,
+        max_total_input_bytes=settings.max_total_input_bytes,
+        max_output_file_bytes=settings.max_output_file_bytes,
+        max_output_files=settings.max_output_files,
+        max_input_files=settings.max_input_files,
     )
 
     # Check Docker availability on startup
@@ -248,6 +253,7 @@ try:
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "exit_code": result.exit_code,
+                        "output_files": result.output_files,
                     },
                     headers=_auth_headers,
                 )
@@ -260,6 +266,7 @@ try:
                         "stderr": result.stderr,
                         "exit_code": result.exit_code,
                         "error": result.error or "Workload failed",
+                        "output_files": result.output_files,
                     },
                     headers=_auth_headers,
                 )

@@ -1,5 +1,5 @@
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 
 _lock = threading.Lock()
@@ -7,6 +7,9 @@ _lock = threading.Lock()
 # In‑memory registry of workers and jobs
 _workers: Dict[str, Dict[str, Any]] = {}
 _jobs: Dict[str, Dict[str, Any]] = {}
+
+# Output file bytes: job_id → {filename → bytes}
+_output_store: Dict[str, Dict[str, bytes]] = {}
 
 
 def _now() -> str:
@@ -56,3 +59,19 @@ def get_job(job_id: str) -> Dict[str, Any] | None:
 def list_jobs() -> Dict[str, Dict[str, Any]]:
     with _lock:
         return dict(_jobs)
+
+# ------------------------------------------------------------------
+# Output file store
+# ------------------------------------------------------------------
+
+def store_output_file(job_id: str, filename: str, content: bytes) -> None:
+    """Store raw output file bytes for a job."""
+    with _lock:
+        if job_id not in _output_store:
+            _output_store[job_id] = {}
+        _output_store[job_id][filename] = content
+
+def get_output_file(job_id: str, filename: str) -> Optional[bytes]:
+    """Retrieve raw output file bytes, or None if not found."""
+    with _lock:
+        return _output_store.get(job_id, {}).get(filename)

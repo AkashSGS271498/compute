@@ -16,6 +16,11 @@ class HeartbeatRequest(BaseModel):
 class JobCreateRequest(BaseModel):
     payload: Dict[str, Any]
 
+class OutputFileMeta(BaseModel):
+    """Metadata (no raw bytes) for an output file."""
+    filename: str
+    size: int
+
 class JobResponse(BaseModel):
     job_id: str
     status: str
@@ -29,6 +34,8 @@ class JobResponse(BaseModel):
     stderr: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    # Output file metadata only — raw bytes served via /outputs/{filename}
+    outputs: Optional[List[OutputFileMeta]] = None
 
 class JobListResponse(BaseModel):
     jobs: List[JobResponse]
@@ -39,6 +46,8 @@ class JobStatusUpdateRequest(BaseModel):
     stderr: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    # Worker sends full file content as base64; backend stores and strips
+    output_files: Optional[List[Dict[str, Any]]] = None
 
 class WorkerAssignRequest(BaseModel):
     job_id: str
