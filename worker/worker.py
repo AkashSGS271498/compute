@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import socket
@@ -33,6 +33,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
+# Worker process start time (used for uptime calculation)
+_WORKER_START_TIME = time.time()
+
 
 # ---------------------------------------------------------
 # Network utilities
@@ -44,34 +47,22 @@ def get_local_ips() -> list[str]:
     ips = []
 
     try:
-        # Connect to a dummy public IP to detect default gateway interface
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
-
         primary_ip = s.getsockname()[0]
-
         if primary_ip and not primary_ip.startswith("127."):
             ips.append(primary_ip)
-
         s.close()
-
     except Exception:
         pass
 
     try:
         hostname = socket.gethostname()
-
         for info in socket.getaddrinfo(hostname, None):
             ip = info[4][0]
-
-            if (
-                ":" not in ip
-                and not ip.startswith("127.")
-                and ip not in ips
-            ):
+            if ":" not in ip and not ip.startswith("127.") and ip not in ips:
                 ips.append(ip)
-
     except Exception:
         pass
 
@@ -107,7 +98,7 @@ def print_startup_banner():
  Worker Hostname : {settings.worker_name}
  Listening Host  : {settings.host} (All network interfaces)
  Listening Port  : {settings.port}
- Local IP(s)     : {', '.join(local_ips)}
+ Local IP(s)     : {", ".join(local_ips)}
 
  Laptop A (Controller) connection command:
    curl http://{local_ips[0]}:{settings.port}/
@@ -115,15 +106,12 @@ def print_startup_banner():
    python scripts/test_milestone1.py --worker-url http://{local_ips[0]}:{settings.port}
 ===================================================================
 """
-
     print(banner, flush=True)
 
 
 # ---------------------------------------------------------
 # FastAPI server
 # ---------------------------------------------------------
-# Try FastAPI first; fallback to standard library
-# http.server if dependencies are not installed.
 
 try:
     import uvicorn
@@ -165,10 +153,32 @@ try:
     # -----------------------------------------------------
     # Global State
     # -----------------------------------------------------
-    
+
     WORKER_STATE = {
         "current_job_id": None
     }
+
+    # -----------------------------------------------------
+    # Resource collection
+    # -----------------------------------------------------
+
+    try:
+        from worker.resources import collect_stats
+    except ImportError:
+        from resources import collect_stats
+
+    # Prime the psutil CPU counter so first call returns a real value
+    try:
+        import psutil as _psutil
+        _psutil.cpu_percent(interval=None)
+    except ImportError:
+        pass
+
+    def _get_stats() -> dict:
+        return collect_stats(
+            current_job_id=WORKER_STATE["current_job_id"],
+            start_time=_WORKER_START_TIME,
+        )
 
     # -----------------------------------------------------
     # Root endpoint
@@ -177,9 +187,7 @@ try:
     @app.get("/")
     def read_root():
         """Root endpoint returning greeting and worker status."""
-
         logger.info("Received request from controller on GET /")
-
         return get_worker_status_data()
 
 
@@ -190,11 +198,25 @@ try:
     @app.get("/health")
     def health_check():
         """Health check endpoint for liveness probes."""
-
         return {
             "status": "healthy",
             "worker": settings.worker_name,
         }
+
+
+    # -----------------------------------------------------
+    # Stats endpoint (Milestone 6)
+    # -----------------------------------------------------
+
+    @app.get("/stats")
+    def get_stats():
+        """
+        Return live resource stats for this worker.
+
+        CPU usage, RAM, current job, uptime, worker state.
+        """
+        return _get_stats()
+
 
     # -----------------------------------------------------
     # Docker Execution Engine
@@ -220,7 +242,7 @@ try:
     if _engine.is_available():
         logger.info("[DOCKER] Docker available")
     else:
-        logger.error("[DOCKER] Docker is unavailable — job execution will fail")
+        logger.error("[DOCKER] Docker is unavailable -- job execution will fail")
 
     # -----------------------------------------------------
     # Background job execution
@@ -295,67 +317,73 @@ try:
 
     @app.post("/jobs/assign")
     def assign_job(req: dict):
-        job_id = req.get("job_id")
+        job_id  = req.get("job_id")
         payload = req.get("payload", {})
 
         if not job_id:
             raise HTTPException(status_code=400, detail="Missing job_id")
-            
+
         if WORKER_STATE["current_job_id"] is not None:
             return {
                 "job_id": job_id,
                 "status": "rejected",
-                "reason": "worker_busy"
+                "reason": "worker_busy",
             }
-            
+
+        # Resource requirements check (defence-in-depth; scheduler already checked)
+        requirements = payload.get("requirements") or {}
+        if requirements:
+            stats = _get_stats()
+            needed_mem  = requirements.get("memory_mb", 0)
+            needed_cpu  = requirements.get("cpu_cores", 0)
+            avail_mem   = stats.get("memory_available_mb", 0)
+            avail_cpu   = stats.get("cpu_cores", 1)
+
+            if stats.get("psutil_available") and needed_mem > 0 and avail_mem < needed_mem:
+                return {
+                    "job_id": job_id,
+                    "status": "rejected",
+                    "reason": f"insufficient_memory: need {needed_mem} MB, have {avail_mem} MB",
+                }
+            if stats.get("psutil_available") and needed_cpu > 0 and avail_cpu < needed_cpu:
+                return {
+                    "job_id": job_id,
+                    "status": "rejected",
+                    "reason": f"insufficient_cpu: need {needed_cpu} cores, have {avail_cpu}",
+                }
+
         WORKER_STATE["current_job_id"] = job_id
         logger.info(f"Accepted job: {job_id}")
 
-        # Spawn background execution thread (non-blocking)
         threading.Thread(
             target=_execute_job_background,
             args=(job_id, payload),
             daemon=True,
         ).start()
-        
+
         return {
             "job_id": job_id,
             "status": "accepted",
-            "worker_id": settings.worker_name
+            "worker_id": settings.worker_name,
         }
 
     @app.post("/jobs/clear")
     def clear_job():
-        # Used by tests to clear worker state
+        """Used by tests to clear worker state."""
         WORKER_STATE["current_job_id"] = None
         return {"status": "cleared"}
 
     # -----------------------------------------------------
-    # Run job endpoint
+    # Run job endpoint (legacy)
     # -----------------------------------------------------
 
     @app.post("/run")
     async def run_job(command: dict):
-        """
-        Execute a simple command payload.
-
-        Expected JSON:
-        {
-            "command": "python",
-            "args": ["script.py"]
-        }
-
-        Returns stdout/stderr and return code.
-        """
-
-        cmd = command.get("command")
+        cmd  = command.get("command")
         args = command.get("args", [])
 
         if not cmd:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing command",
-            )
+            raise HTTPException(status_code=400, detail="Missing command")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -364,24 +392,15 @@ try:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-
             stdout, stderr = await proc.communicate()
-
             return {
                 "output": stdout.decode(),
                 "error": stderr.decode(),
                 "returncode": proc.returncode,
             }
-
         except Exception as e:
-            logger.error(
-                f"Job execution failed: {e}"
-            )
-
-            raise HTTPException(
-                status_code=500,
-                detail=str(e),
-            )
+            logger.error(f"Job execution failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
     # -----------------------------------------------------
@@ -391,15 +410,13 @@ try:
     def start_server():
         print_startup_banner()
 
-        # Auth header required by the backend
         _auth_headers = {
             "Authorization": f"Bearer {settings.backend_secret}",
             "Content-Type": "application/json",
         }
 
-        # Register worker with backend and start heartbeat thread
         try:
-            _real_ip = get_local_ips()[0]  # actual LAN IP, not 0.0.0.0
+            _real_ip = get_local_ips()[0]
             resp = httpx.post(
                 f"{settings.backend_url}/register",
                 json={
@@ -409,43 +426,25 @@ try:
                 },
                 headers=_auth_headers,
             )
-
             resp.raise_for_status()
-
             worker_id = resp.json().get("worker_id")
-
-            logger.info(
-                f"Worker registered with ID: {worker_id}"
-            )
-
-            # ---------------------------------------------
-            # Heartbeat
-            # ---------------------------------------------
+            logger.info(f"Worker registered with ID: {worker_id}")
 
             if worker_id:
-
                 def _heartbeat_loop(wid, hdrs):
-
                     while True:
-
                         try:
+                            stats = _get_stats()
                             hb_resp = httpx.post(
                                 f"{settings.backend_url}/heartbeat",
-                                json={"worker_id": wid},
+                                json={"worker_id": wid, "stats": stats},
                                 headers=hdrs,
                             )
-
                             hb_resp.raise_for_status()
-
-                            logger.debug("Heartbeat sent")
-
+                            logger.debug(f"Heartbeat sent (state={stats.get('worker_state')})")
                         except Exception as e:
-                            logger.error(
-                                f"Heartbeat error: {e}"
-                            )
-
+                            logger.error(f"Heartbeat error: {e}")
                         time.sleep(30)
-
 
                 threading.Thread(
                     target=_heartbeat_loop,
@@ -453,16 +452,8 @@ try:
                     daemon=True,
                 ).start()
 
-
         except Exception as e:
-            logger.error(
-                f"Worker registration failed: {e}"
-            )
-
-
-        # ---------------------------------------------
-        # Start FastAPI server
-        # ---------------------------------------------
+            logger.error(f"Worker registration failed: {e}")
 
         uvicorn.run(
             app,
@@ -478,99 +469,41 @@ try:
 
 except ImportError:
 
-    # Standard library fallback so Milestone 1 works
-    # even before pip install.
-
     from http.server import (
         BaseHTTPRequestHandler,
         HTTPServer,
     )
 
-
     class WorkerHTTPHandler(BaseHTTPRequestHandler):
 
         def do_GET(self):
-
             if self.path in ("/", "/health"):
-
                 self.send_response(200)
-
-                self.send_header(
-                    "Content-Type",
-                    "application/json",
-                )
-
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
-
                 data = get_worker_status_data()
-
-                self.wfile.write(
-                    json.dumps(
-                        data,
-                        indent=2,
-                    ).encode("utf-8")
-                )
-
-                logger.info(
-                    "Responded to GET %s with status 200",
-                    self.path,
-                )
-
+                self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+                logger.info("Responded to GET %s with status 200", self.path)
             else:
-
                 self.send_response(404)
-
-                self.send_header(
-                    "Content-Type",
-                    "application/json",
-                )
-
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
-
-                self.wfile.write(
-                    json.dumps(
-                        {"error": "Not Found"}
-                    ).encode("utf-8")
-                )
-
+                self.wfile.write(json.dumps({"error": "Not Found"}).encode("utf-8"))
 
         def log_message(self, format, *args):
-
-            logger.info(
-                "%s - %s",
-                self.address_string(),
-                format % args,
-            )
-
-
-    # -----------------------------------------------------
-    # Start fallback server
-    # -----------------------------------------------------
+            logger.info("%s - %s", self.address_string(), format % args)
 
     def start_server():
-
         print_startup_banner()
-
         logger.warning(
-            "FastAPI/Uvicorn not found; using standard "
-            "library HTTP server. Install worker/requirements.txt "
-            "for the full stack."
+            "FastAPI/Uvicorn not found; using standard library HTTP server. "
+            "Install worker/requirements.txt for the full stack."
         )
-
-        server = HTTPServer(
-            (settings.host, settings.port),
-            WorkerHTTPHandler,
-        )
-
+        server = HTTPServer((settings.host, settings.port), WorkerHTTPHandler)
         try:
             server.serve_forever()
-
         except KeyboardInterrupt:
-
-            print(
-                "\nWorker server stopped gracefully."
-            )
-
+            print("\nWorker server stopped gracefully.")
             server.server_close()
 
 
@@ -580,4 +513,3 @@ except ImportError:
 
 if __name__ == "__main__":
     start_server()
-

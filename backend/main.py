@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import uuid
 import logging
 from fastapi import FastAPI, HTTPException, Depends
@@ -23,6 +23,7 @@ from backend.state import (
     list_workers,
     update_worker,
     get_output_file,
+    mark_offline_workers,
 )
 
 app = FastAPI(
@@ -92,7 +93,7 @@ def register(req: RegisterRequest):
 def heartbeat(req: HeartbeatRequest):
     if not get_worker(req.worker_id):
         raise HTTPException(status_code=404, detail="Worker not found")
-    update_heartbeat(req.worker_id)
+    update_heartbeat(req.worker_id, stats=req.stats)
     logger.info(f"Heartbeat received from {req.worker_id}")
     return {"status": "alive"}
 
@@ -235,9 +236,31 @@ def download_output(job_id: str, filename: str, token: str = Depends(verify_toke
     )
 
 # ------------------------------------------------------------------
-# Workers list
+# Workers list + per-worker stats
 # ------------------------------------------------------------------
 
 @app.get("/workers")
 def workers(token: str = Depends(verify_token)):
+    mark_offline_workers()   # lazy offline detection
     return list_workers()
+
+
+@app.get("/workers/{worker_id}/stats")
+def worker_stats(worker_id: str, token: str = Depends(verify_token)):
+    """
+    Return the cached resource snapshot from the worker's last heartbeat.
+
+    Fields: cpu_cores, cpu_percent, memory_total_mb, memory_available_mb,
+            memory_percent, worker_state, uptime_seconds, current_job_id.
+    """
+    mark_offline_workers()
+    w = get_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    stats = w.get("stats")
+    if not stats:
+        raise HTTPException(
+            status_code=404,
+            detail="No stats available yet — worker has not sent a heartbeat with stats"
+        )
+    return stats

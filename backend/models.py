@@ -12,6 +12,7 @@ class RegisterResponse(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     worker_id: str
+    stats: Optional[Dict[str, Any]] = None
 
 class JobCreateRequest(BaseModel):
     payload: Dict[str, Any]
