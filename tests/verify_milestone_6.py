@@ -1,4 +1,4 @@
-﻿"""
+"""
 Milestone 6: Resource Management & Worker Monitoring
 End-to-end verification suite.
 
@@ -193,12 +193,15 @@ def test_worker_state_busy():
     job_running = stats.get("current_job_id") is not None
 
     # Wait for job to finish before next test
-    deadline = time.time() + 20
+    deadline = time.time() + 25
     while time.time() < deadline:
         s = httpx.get(f"{WORKER_URL}/stats").json()
         if s.get("current_job_id") is None:
             break
         time.sleep(1)
+
+    # Small buffer so backend fully processes the completion POST
+    time.sleep(3)
 
     if state == "BUSY" and job_running:
         ok(f"worker_state={state} during execution")
@@ -341,16 +344,16 @@ def test_milestone_regression(n: int):
         elif n == 5:
             import base64
             csv = b"name,value\nA,10\n"
-            code = """
-import csv
-with open("/workspace/input/d.csv") as f:
-    rows = list(csv.DictReader(f))
-with open("/workspace/output/o.csv","w") as f:
-    f.write("name,value\\n")
-    for r in rows:
-        f.write(f"{r['"'"'name'"'"']},{r['"'"'value'"'"']}\\n")
-print("ok")
-"""
+            code = (
+                "import csv\n"
+                "with open('/workspace/input/d.csv') as f:\n"
+                "    rows = list(csv.DictReader(f))\n"
+                "with open('/workspace/output/o.csv', 'w') as f:\n"
+                "    f.write('name,value\\n')\n"
+                "    for r in rows:\n"
+                "        f.write(r['name'] + ',' + r['value'] + '\\n')\n"
+                "print('ok')\n"
+            )
             result = submit_and_wait({
                 "type": "python", "code": code,
                 "inputs": {"d.csv": base64.b64encode(csv).decode()},

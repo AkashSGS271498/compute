@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import os
 import socket
@@ -374,6 +374,70 @@ try:
         return {"status": "cleared"}
 
     # -----------------------------------------------------
+    # Log streaming endpoint (Milestone 7)
+    # -----------------------------------------------------
+
+    from fastapi.responses import StreamingResponse
+    try:
+        from worker.execution.docker import get_log_buffer
+    except ImportError:
+        from execution.docker import get_log_buffer
+
+    @app.get("/jobs/{job_id}/stream")
+    def stream_job_logs(job_id: str):
+        """
+        Stream live log output for *job_id* as Server-Sent Events.
+
+        Events:
+            data: {"seq": int, "source": "stdout"|"stderr", "line": str}
+            event: done  data: {"status": "completed"|"failed"|"unknown"}
+
+        Returns 404 immediately if the job has never been seen by this worker.
+        If the job is currently assigned (buffer not yet created) we wait up to
+        10 s for the Docker execution thread to register the LogBuffer.
+        """
+        import time as _time
+        import json as _json
+
+        buf = get_log_buffer(job_id)
+
+        if buf is None:
+            # Only wait if this worker currently owns the job (buffer is about
+            # to be registered by the execution thread).
+            if WORKER_STATE.get("current_job_id") == job_id:
+                deadline = _time.monotonic() + 10.0
+                while buf is None and _time.monotonic() < deadline:
+                    _time.sleep(0.1)
+                    buf = get_log_buffer(job_id)
+
+        if buf is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No log buffer for job (not assigned to this worker or already evicted)",
+            )
+
+        def _event_generator():
+            for entry in buf.iter_from(start_seq=0, timeout=600):
+                payload = _json.dumps({
+                    "seq":    entry["seq"],
+                    "source": entry["source"],
+                    "line":   entry["line"],
+                })
+                yield f"data: {payload}\n\n"
+            # Emit final "done" event
+            final = buf.final_status or "unknown"
+            yield f"event: done\ndata: {_json.dumps({'status': final})}\n\n"
+
+        return StreamingResponse(
+            _event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # -----------------------------------------------------
     # Run job endpoint (legacy)
     # -----------------------------------------------------
 
@@ -416,7 +480,10 @@ try:
         }
 
         try:
-            _real_ip = get_local_ips()[0]
+            # Allow tests/deployments to override the registration host.
+            # WORKER_REGISTER_HOST=127.0.0.1 makes the extra worker reachable
+            # from the backend scheduler on the same machine.
+            _real_ip = os.environ.get("WORKER_REGISTER_HOST") or get_local_ips()[0]
             resp = httpx.post(
                 f"{settings.backend_url}/register",
                 json={
@@ -431,24 +498,73 @@ try:
             logger.info(f"Worker registered with ID: {worker_id}")
 
             if worker_id:
-                def _heartbeat_loop(wid, hdrs):
+                # Send an immediate heartbeat+stats so backend has resource
+                # data from second 0 (instead of waiting up to 30 s).
+                try:
+                    httpx.post(
+                        f"{settings.backend_url}/heartbeat",
+                        json={"worker_id": worker_id, "stats": _get_stats()},
+                        headers=_auth_headers,
+                    )
+                    logger.debug("Initial heartbeat with stats sent")
+                except Exception as e:
+                    logger.warning(f"Initial heartbeat failed: {e}")
+
+                def _heartbeat_loop(wid_ref: list, hdrs: dict):
+                    """
+                    Sends a heartbeat every 30 s.
+                    On 404 (backend restarted) the worker re-registers
+                    and immediately pushes a fresh heartbeat.
+                    """
                     while True:
                         try:
-                            stats = _get_stats()
+                            stats   = _get_stats()
                             hb_resp = httpx.post(
                                 f"{settings.backend_url}/heartbeat",
-                                json={"worker_id": wid, "stats": stats},
+                                json={"worker_id": wid_ref[0], "stats": stats},
                                 headers=hdrs,
                             )
-                            hb_resp.raise_for_status()
-                            logger.debug(f"Heartbeat sent (state={stats.get('worker_state')})")
+
+                            if hb_resp.status_code == 404:
+                                logger.warning(
+                                    "Heartbeat 404 - backend restarted? Re-registering..."
+                                )
+                                reg = httpx.post(
+                                    f"{settings.backend_url}/register",
+                                    json={
+                                        "worker_name": settings.worker_name,
+                                        "host": get_local_ips()[0],
+                                        "port": settings.port,
+                                    },
+                                    headers=hdrs,
+                                )
+                                reg.raise_for_status()
+                                new_id = reg.json().get("worker_id")
+                                if new_id:
+                                    wid_ref[0] = new_id
+                                    logger.info(
+                                        f"Re-registered with new worker_id: {new_id}"
+                                    )
+                                    # Push fresh stats immediately
+                                    httpx.post(
+                                        f"{settings.backend_url}/heartbeat",
+                                        json={"worker_id": new_id, "stats": _get_stats()},
+                                        headers=hdrs,
+                                    )
+                            else:
+                                hb_resp.raise_for_status()
+                                logger.debug(
+                                    f"Heartbeat sent (state={stats.get('worker_state')})"
+                                )
+
                         except Exception as e:
                             logger.error(f"Heartbeat error: {e}")
+
                         time.sleep(30)
 
                 threading.Thread(
                     target=_heartbeat_loop,
-                    args=(worker_id, _auth_headers),
+                    args=([worker_id], _auth_headers),
                     daemon=True,
                 ).start()
 

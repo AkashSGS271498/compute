@@ -1,4 +1,4 @@
-﻿"""
+"""
 Job scheduler — selects the best available worker for a job.
 
 Milestone 6: resource-aware scheduling.
@@ -91,7 +91,9 @@ def schedule_job(job_id: str) -> None:
     candidates.sort(key=lambda x: x[2], reverse=True)
     selected_worker_id, selected_worker, _ = candidates[0]
 
-    worker_url = f"http://{selected_worker['"'"'host'"'"']}:{selected_worker['"'"'port'"'"']}"
+    host = selected_worker.get("host", "127.0.0.1")
+    port = selected_worker.get("port", 8001)
+    worker_url = f"http://{host}:{port}"
 
     try:
         update_job_status(job_id, "assigned")
@@ -109,13 +111,21 @@ def schedule_job(job_id: str) -> None:
         data = resp.json()
 
         if data.get("status") != "accepted":
-            raise ValueError(f"Worker rejected job: {data.get('"'"'reason'"'"')}")
+            reason = data.get("reason", "unknown")
+            raise ValueError(f"Worker rejected job: {reason}")
 
     except Exception as e:
         logger.error(f"Failed to assign job {job_id} to worker {selected_worker_id}: {e}")
+        # Reset worker and re-queue the job so the scheduler loop can retry
         update_worker(selected_worker_id, {"current_job_id": None})
         update_job(job_id, {"worker_id": None})
         try:
-            update_job_status(job_id, "failed", error=str(e))
-        except ValueError:
-            pass
+            # Reset to queued — bypass the state machine directly via update_job
+            from backend.state import update_job as _update_job_state
+            _update_job_state(job_id, {
+                "status": "queued",
+                "worker_id": None,
+                "assigned_at": None,
+            })
+        except Exception as inner:
+            logger.error(f"Failed to re-queue job {job_id}: {inner}")

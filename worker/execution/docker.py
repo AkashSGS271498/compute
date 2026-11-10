@@ -1,19 +1,56 @@
-﻿"""Docker-based execution engine for running workloads in containers."""
+"""Docker-based execution engine for running workloads in containers."""
 
 import base64
 import logging
 import os
 import shutil
 import tempfile
-from typing import Dict, Any, List
+import threading
+from typing import Dict, Any, List, Optional
 
 import docker
 from docker.errors import DockerException, ImageNotFound, APIError
 
 from worker.execution.base import ExecutionEngine, ExecutionResult
 from worker.file_utils import validate_filename, safe_join
+from worker.log_buffer import LogBuffer
 
 logger = logging.getLogger("worker.docker")
+
+# ---------------------------------------------------------------------------
+# Global live-log registry
+#
+# Maps  job_id  →  LogBuffer  for all jobs currently running (or recently
+# finished).  The worker's SSE endpoint reads from here.
+# A cleanup thread removes sealed buffers after a grace period.
+# ---------------------------------------------------------------------------
+_live_logs: Dict[str, "LogBuffer"] = {}
+_live_logs_lock = threading.Lock()
+_LOG_RETAIN_SECONDS = 120   # keep sealed buffers this long
+
+
+def get_log_buffer(job_id: str) -> Optional["LogBuffer"]:
+    """Return the LogBuffer for *job_id*, or None if not found."""
+    with _live_logs_lock:
+        return _live_logs.get(job_id)
+
+
+def _register_buffer(job_id: str, buf: "LogBuffer") -> None:
+    with _live_logs_lock:
+        _live_logs[job_id] = buf
+
+
+def _schedule_cleanup(job_id: str, delay: float) -> None:
+    """Remove a sealed LogBuffer from the registry after *delay* seconds."""
+    def _remove():
+        import time
+        time.sleep(delay)
+        with _live_logs_lock:
+            _live_logs.pop(job_id, None)
+        logger.debug(f"[DOCKER] LogBuffer for {job_id} evicted from registry")
+
+    t = threading.Thread(target=_remove, daemon=True, name=f"log-cleanup-{job_id[:8]}")
+    t.start()
 
 
 class DockerExecutionEngine(ExecutionEngine):
@@ -238,11 +275,45 @@ class DockerExecutionEngine(ExecutionEngine):
 
             logger.info(f"[DOCKER] Container started: {container_name}")
 
-            # 7. Wait for completion with timeout ──────────────────
+            # 7. Create log buffer and stream logs in background ───
+            log_buf = LogBuffer(job_id)
+            _register_buffer(job_id, log_buf)
+            stdout_accumulator: list[str] = []
+            stream_done = threading.Event()
+
+            def _stream_logs() -> None:
+                """Read combined stdout/stderr from Docker and feed the buffer."""
+                try:
+                    for chunk in container.logs(
+                        stdout=True,
+                        stderr=True,
+                        stream=True,
+                        follow=True,
+                        timestamps=False,
+                    ):
+                        if isinstance(chunk, bytes):
+                            chunk = chunk.decode("utf-8", errors="replace")
+                        log_buf.append("stdout", chunk)
+                        stdout_accumulator.append(chunk)
+                except Exception as exc:
+                    logger.debug(f"[DOCKER] Log stream ended: {exc}")
+                finally:
+                    stream_done.set()
+
+            log_thread = threading.Thread(
+                target=_stream_logs,
+                daemon=True,
+                name=f"log-stream-{job_id[:8]}",
+            )
+            log_thread.start()
+
+            # 8. Wait for container to exit (with timeout) ─────────
             timed_out = False
+            exit_code = -1
             try:
                 wait_result = container.wait(timeout=self.timeout_seconds)
                 exit_code = wait_result.get("StatusCode", -1)
+                stream_done.wait(timeout=5)   # let log thread finish draining
             except Exception:
                 timed_out = True
                 logger.warning(
@@ -252,10 +323,15 @@ class DockerExecutionEngine(ExecutionEngine):
                     container.kill()
                 except Exception:
                     pass
+                stream_done.wait(timeout=5)
 
-            # 8. Collect stdout/stderr ─────────────────────────────
-            stdout = self._safe_logs(container, stdout=True, stderr=False)
+            # 9. Assemble output strings and seal buffer ───────────
+            stdout = "".join(stdout_accumulator)
             stderr = self._safe_logs(container, stdout=False, stderr=True)
+
+            final_status = "failed" if (timed_out or exit_code != 0) else "completed"
+            log_buf.seal(final_status)
+            _schedule_cleanup(job_id, _LOG_RETAIN_SECONDS)
 
             if timed_out:
                 return ExecutionResult(
@@ -266,7 +342,7 @@ class DockerExecutionEngine(ExecutionEngine):
                     output_files=self._collect_outputs(output_dir),
                 )
 
-            # 9. Collect output files ──────────────────────────────
+            # 10. Collect output files ─────────────────────────────
             output_files = self._collect_outputs(output_dir)
 
             logger.info(f"[DOCKER] Exit code: {exit_code}")

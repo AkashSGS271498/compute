@@ -1,8 +1,9 @@
 import base64
 import uuid
 import logging
+import httpx as _httpx
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from backend.config import settings
 from backend.models import (
@@ -14,7 +15,7 @@ from backend.models import (
     JobListResponse,
     JobStatusUpdateRequest,
 )
-from backend.services.job_manager import create_job, get_job_by_id, get_all_jobs, update_job_status
+from backend.services.job_manager import create_job, get_job_by_id, get_all_jobs, update_job_status, requeue_job_for_retry
 from backend.services.scheduler import schedule_job
 from backend.state import (
     register_worker,
@@ -24,7 +25,10 @@ from backend.state import (
     update_worker,
     get_output_file,
     mark_offline_workers,
+    get_dead_workers,
+    get_jobs_for_worker,
 )
+from backend.database import db_counts
 
 app = FastAPI(
     title="Personal Distributed Compute – Backend",
@@ -37,6 +41,58 @@ logger.setLevel(settings.log_level.upper())
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 logger.addHandler(handler)
+
+# ------------------------------------------------------------------
+# Background loops (M7 scheduler retry + M8 fault tolerance)
+# ------------------------------------------------------------------
+import threading as _threading
+import time as _time
+
+def _scheduler_loop() -> None:
+    """
+    Every 2 s:
+      1. Detect dead workers (heartbeat expired) → mark offline → recover jobs
+      2. Re-queue jobs on dead workers (up to MAX_RETRIES times)
+      3. Reschedule all QUEUED jobs so nothing stays stuck
+    """
+    while True:
+        _time.sleep(2)
+        try:
+            # --- M8: Dead worker detection & job recovery ----------------
+            dead_wids = get_dead_workers()
+            for wid in dead_wids:
+                worker = get_worker(wid)
+                if not worker:
+                    continue
+                if worker.get("status") == "offline":
+                    continue   # already processed
+
+                # Mark offline
+                update_worker(wid, {"status": "offline", "worker_state": "OFFLINE"})
+                logger.warning(f"[M8] Worker {wid[:8]} detected offline — recovering jobs")
+
+                # Find jobs assigned to this dead worker
+                stranded = get_jobs_for_worker(wid)
+                for job in stranded:
+                    jid = job["job_id"]
+                    requeued = requeue_job_for_retry(jid)
+                    if requeued:
+                        logger.info(f"[M8] Job {jid[:8]} re-queued (retry {job.get('retry_count',0)+1})")
+                    else:
+                        logger.warning(f"[M8] Job {jid[:8]} permanently failed (max retries exceeded)")
+
+            # --- M7/M8: Reschedule all QUEUED jobs -----------------------
+            queued = [j for j in get_all_jobs() if j.get("status") == "queued"]
+            for job in queued:
+                _threading.Thread(
+                    target=schedule_job,
+                    args=(job["job_id"],),
+                    daemon=True,
+                ).start()
+        except Exception as exc:
+            logger.debug(f"[scheduler-loop] error: {exc}")
+
+_threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler-loop").start()
 
 security = HTTPBearer()
 
@@ -195,6 +251,72 @@ def update_status(job_id: str, req: JobStatusUpdateRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 # ------------------------------------------------------------------
+# Log stream proxy (Milestone 7)
+# ------------------------------------------------------------------
+
+@app.get("/jobs/{job_id}/stream")
+def stream_job_logs(job_id: str, token: str = Depends(verify_token)):
+    """
+    Proxy the live SSE log stream from the worker that owns this job.
+
+    The backend looks up the worker's host/port from the job record and
+    opens a streaming connection to  GET http://<worker>/jobs/{job_id}/stream,
+    forwarding each SSE chunk verbatim to the calling client.
+
+    Returns:
+        text/event-stream — same format as the worker endpoint.
+
+    Raises:
+        404 if job or worker not found.
+        502 if the worker stream is unavailable.
+    """
+    job = get_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    worker_id = job.get("worker_id")
+    if not worker_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Job has not been assigned to a worker yet"
+        )
+
+    worker = get_worker(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    host = worker.get("host", "127.0.0.1")
+    port = worker.get("port", 8001)
+    worker_stream_url = f"http://{host}:{port}/jobs/{job_id}/stream"
+
+    def _proxy():
+        try:
+            with _httpx.stream("GET", worker_stream_url, timeout=620) as resp:
+                if resp.status_code == 404:
+                    # Worker says no buffer — job may have already finished and
+                    # buffer evicted; emit a synthetic done event.
+                    final_status = job.get("status", "unknown")
+                    import json as _json
+                    yield f"event: done\ndata: {_json.dumps({'status': final_status})}\n\n"
+                    return
+                for chunk in resp.iter_text():
+                    if chunk:
+                        yield chunk
+        except _httpx.RequestError as exc:
+            import json as _json
+            yield f"event: error\ndata: {_json.dumps({'detail': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        _proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ------------------------------------------------------------------
 # Output file download
 # ------------------------------------------------------------------
 
@@ -264,3 +386,38 @@ def worker_stats(worker_id: str, token: str = Depends(verify_token)):
             detail="No stats available yet — worker has not sent a heartbeat with stats"
         )
     return stats
+
+
+# ------------------------------------------------------------------
+# M9: DB stats / health
+# ------------------------------------------------------------------
+
+@app.get("/db/stats")
+def db_stats(token: str = Depends(verify_token)):
+    """Return SQLite row counts — useful to verify persistence is working."""
+    return db_counts()
+
+
+@app.get("/stats")
+def cluster_stats(token: str = Depends(verify_token)):
+    """Cluster-wide summary: worker counts, job counts, DB stats."""
+    mark_offline_workers()
+    all_workers = list_workers()
+    all_jobs = get_all_jobs()
+    online = sum(1 for w in all_workers.values() if w.get("status") == "online")
+    return {
+        "workers": {
+            "total": len(all_workers),
+            "online": online,
+            "offline": len(all_workers) - online,
+        },
+        "jobs": {
+            "total": len(all_jobs),
+            "queued":    sum(1 for j in all_jobs if j.get("status") == "queued"),
+            "assigned":  sum(1 for j in all_jobs if j.get("status") == "assigned"),
+            "running":   sum(1 for j in all_jobs if j.get("status") == "running"),
+            "completed": sum(1 for j in all_jobs if j.get("status") == "completed"),
+            "failed":    sum(1 for j in all_jobs if j.get("status") == "failed"),
+        },
+        "storage": db_counts(),
+    }

@@ -7,6 +7,9 @@ class BackendSettings(BaseSettings):
     port: int = Field(default=8000, alias="BACKEND_PORT")
     secret_token: str = Field(default="supersecret", alias="BACKEND_SECRET")
     log_level: str = Field(default="INFO", alias="BACKEND_LOG_LEVEL")
+    # M9: Persistent storage paths
+    db_path: str = Field(default="data/backend.db", alias="BACKEND_DB_PATH")
+    output_dir: str = Field(default="data/outputs", alias="BACKEND_OUTPUT_DIR")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

@@ -44,3 +44,11 @@ venv.bak/
 # Docker / Jobs temporary files
 tmp/
 jobs/
+
+data/
+__pycache__/
+*.pyc
+.env
+venv/
+*.db
+
