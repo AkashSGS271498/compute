@@ -12,7 +12,7 @@ Modern workflows often involve multiple personal machines sitting idle. This pro
 - One or more **Workers** (other laptops) auto-register, execute jobs inside Docker containers, and send heartbeats.
 - A **Controller** (Laptop A) submits jobs — including input files — and retrieves results, output files, and live logs.
 
-**Current capability (Milestone 9):** Resource-aware scheduling, live log streaming, fault tolerance with auto-retry, and full SQLite persistence — jobs, workers, and output files survive backend restarts.
+**Current capability (Milestone 10):** Full 10-milestone distributed compute cluster — resource-aware scheduling, live log streaming, fault tolerance, SQLite persistence, and Tailscale-aware cross-internet mesh networking.
 
 ---
 
@@ -115,6 +115,7 @@ distributed-compute/
 ├── worker/
 │   ├── worker.py            # Worker FastAPI service + SSE stream endpoint
 │   ├── config.py            # Worker settings incl. Docker + file limits
+│   ├── network.py           # M10: Tailscale-aware IP detection + network mode resolution
 │   ├── file_utils.py        # Filename validation + path-traversal prevention
 │   ├── log_buffer.py        # Thread-safe ring buffer for live container logs
 │   ├── resources.py         # psutil-based CPU/RAM reporting
@@ -133,7 +134,9 @@ distributed-compute/
 │   ├── backend.db           # SQLite database (workers + jobs)
 │   └── outputs/             # Output files: outputs/<job_id>/<filename>
 ├── scripts/
-│   └── submit_job.py        # Controller CLI helper
+│   ├── submit_job.py        # Controller CLI helper
+│   ├── setup_tailscale.py   # M10: Tailscale setup checker + onboarding guide
+│   └── check_connectivity.py # M10: End-to-end connectivity probe
 ├── tests/
 │   ├── verify_milestone_3.py
 │   ├── verify_milestone_4.py
@@ -141,7 +144,8 @@ distributed-compute/
 │   ├── verify_milestone_6.py
 │   ├── verify_milestone_7.py
 │   ├── verify_milestone_8.py
-│   └── verify_milestone_9.py
+│   ├── verify_milestone_9.py
+│   └── verify_milestone_10.py
 ├── docs/
 │   └── architecture.md
 ├── .env.example
@@ -586,6 +590,7 @@ venv\Scripts\python.exe tests\verify_milestone_6.py
 venv\Scripts\python.exe tests\verify_milestone_7.py
 venv\Scripts\python.exe tests\verify_milestone_8.py
 venv\Scripts\python.exe tests\verify_milestone_9.py
+venv\Scripts\python.exe tests\verify_milestone_10.py
 
 $b.Kill(); $w.Kill()
 ```
@@ -612,10 +617,104 @@ Expected outcome for each: `VERIFICATION RESULT: SUCCESS`
 | M7 | Live log streaming: SSE from Docker → worker LogBuffer → backend proxy → controller | ✅ |
 | M8 | Fault tolerance: dead worker detection (60 s), job recovery, retry with limit (MAX=3), scheduler resilience | ✅ |
 | M9 | Persistent storage: SQLite for workers/jobs, disk-backed output files, survive backend restarts | ✅ |
-| M10 | Secure cross-internet mesh (Tailscale / WireGuard) | 🔲 |
+| M10 | Cross-internet mesh: Tailscale-aware IP detection, network mode selection, connectivity probe, setup guide | ✅ |
 
 ---
 
-## 16. License
+## 16. Cross-Internet Mesh (M10)
+
+Workers and backend can be connected across the internet using **Tailscale** — a WireGuard-based VPN mesh that requires no port-forwarding or static IPs.
+
+### Network mode priority
+
+The worker resolves its registration IP in this order:
+
+```
+1. WORKER_REGISTER_HOST   (explicit override — always wins)
+2. Tailscale IP           (100.64.x.x – 100.127.x.x) — cross-internet
+3. LAN IP                 (primary outbound interface)
+4. 127.0.0.1              (last resort)
+```
+
+Control this with `WORKER_NETWORK_MODE`:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` *(default)* | Tailscale if available, else LAN |
+| `tailscale` | Force Tailscale IP — error if not found |
+| `lan` | Skip Tailscale, use LAN IP |
+| `custom` | Use `WORKER_REGISTER_HOST` exactly |
+
+### Worker startup banner (Tailscale active)
+
+```
+===================================================================
+      PERSONAL DISTRIBUTED COMPUTE NETWORK - WORKER NODE
+===================================================================
+ Worker Hostname : DESKTOP-XYZ
+ Listening Host  : 0.0.0.0 (All network interfaces)
+ Listening Port  : 8001
+ Register IP     : 100.90.12.34  (tailscale)
+ All IP(s)       : 100.90.12.34, 192.168.1.20
+ Network Mode   : Tailscale ✓  (3 peer(s) online)
+ MagicDNS Host  : desktop-xyz.tail12345.ts.net
+
+ Backend URL     : http://backend-host.tail12345.ts.net:8000
+===================================================================
+```
+
+### Quick setup with Tailscale
+
+```powershell
+# 1. Install Tailscale on every machine → https://tailscale.com/download
+# 2. Run on each machine:
+tailscale up
+
+# 3. Check this machine's setup:
+python scripts/setup_tailscale.py
+
+# 4. Start backend (Laptop A) — Tailscale handles routing, no firewall rules needed
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+# 5. Start worker (Laptop B, different network)
+$env:WORKER_NETWORK_MODE = "tailscale"
+$env:BACKEND_URL          = "http://<BACKEND_TAILSCALE_IP>:8000"
+python worker\worker.py
+
+# 6. Verify end-to-end connectivity
+python scripts/check_connectivity.py --backend http://<BACKEND_TAILSCALE_IP>:8000
+```
+
+### Recommended Tailscale ACL
+
+Lock down ports 8000/8001 to cluster members only (paste into Tailscale admin → Access controls):
+
+```json
+{
+  "acls": [
+    {
+      "action": "accept",
+      "src":    ["tag:dc-cluster"],
+      "dst":    ["tag:dc-cluster:8000", "tag:dc-cluster:8001"]
+    }
+  ],
+  "tagOwners": {
+    "tag:dc-cluster": ["autogroup:member"]
+  }
+}
+```
+
+Tag each backend/worker machine with `dc-cluster` in the Tailscale admin console.
+
+### Helper scripts
+
+| Script | Purpose |
+|---|---|
+| `python scripts/setup_tailscale.py` | Checks Tailscale install, shows your TS IP, prints ready-to-run commands |
+| `python scripts/check_connectivity.py --backend <url>` | Full end-to-end probe: backend reachable → worker online → job submits → job completes |
+
+---
+
+## 17. License
 
 MIT

@@ -38,34 +38,17 @@ _WORKER_START_TIME = time.time()
 
 
 # ---------------------------------------------------------
-# Network utilities
+# Network utilities (M10: Tailscale-aware)
 # ---------------------------------------------------------
 
+try:
+    from worker.network import resolve_registration_ip, get_tailscale_status, _get_all_ipv4s
+except ImportError:
+    from network import resolve_registration_ip, get_tailscale_status, _get_all_ipv4s
+
 def get_local_ips() -> list[str]:
-    """Discover outward-facing LAN IPv4 addresses of this machine."""
-
-    ips = []
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.5)
-        s.connect(("8.8.8.8", 80))
-        primary_ip = s.getsockname()[0]
-        if primary_ip and not primary_ip.startswith("127."):
-            ips.append(primary_ip)
-        s.close()
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None):
-            ip = info[4][0]
-            if ":" not in ip and not ip.startswith("127.") and ip not in ips:
-                ips.append(ip)
-    except Exception:
-        pass
-
+    """Return all non-loopback IPv4s (kept for backward compat)."""
+    ips = _get_all_ipv4s()
     return ips if ips else ["127.0.0.1"]
 
 
@@ -89,7 +72,20 @@ def get_worker_status_data() -> dict:
 # ---------------------------------------------------------
 
 def print_startup_banner():
-    local_ips = get_local_ips()
+    _override = os.environ.get("WORKER_REGISTER_HOST")
+    _mode = os.environ.get("WORKER_NETWORK_MODE", "auto")
+    reg_ip, net_mode, all_ips = resolve_registration_ip(mode=_mode, override=_override)
+
+    ts = get_tailscale_status()
+    ts_line = ""
+    if ts["installed"] and ts["running"]:
+        ts_line = f"\n Network Mode   : Tailscale ✓  ({ts['peers']} peer(s) online)"
+        if ts["hostname"]:
+            ts_line += f"\n MagicDNS Host  : {ts['hostname']}"
+    elif net_mode == "tailscale":
+        ts_line = f"\n Network Mode   : Tailscale (IP detected, CLI not in PATH)"
+    else:
+        ts_line = f"\n Network Mode   : LAN"
 
     banner = f"""
 ===================================================================
@@ -98,12 +94,13 @@ def print_startup_banner():
  Worker Hostname : {settings.worker_name}
  Listening Host  : {settings.host} (All network interfaces)
  Listening Port  : {settings.port}
- Local IP(s)     : {", ".join(local_ips)}
+ Register IP     : {reg_ip}  ({net_mode})
+ All IP(s)       : {", ".join(all_ips)}{ts_line}
 
- Laptop A (Controller) connection command:
-   curl http://{local_ips[0]}:{settings.port}/
-   or
-   python scripts/test_milestone1.py --worker-url http://{local_ips[0]}:{settings.port}
+ Backend URL     : {settings.backend_url}
+
+ Controller connection command:
+   curl http://{reg_ip}:{settings.port}/
 ===================================================================
 """
     print(banner, flush=True)
@@ -480,10 +477,13 @@ try:
         }
 
         try:
-            # Allow tests/deployments to override the registration host.
-            # WORKER_REGISTER_HOST=127.0.0.1 makes the extra worker reachable
-            # from the backend scheduler on the same machine.
-            _real_ip = os.environ.get("WORKER_REGISTER_HOST") or get_local_ips()[0]
+            # M10: resolve registration IP via network mode (Tailscale > LAN > loopback)
+            _net_override = os.environ.get("WORKER_REGISTER_HOST")
+            _net_mode     = os.environ.get("WORKER_NETWORK_MODE", "auto")
+            _real_ip, _net_mode_used, _ = resolve_registration_ip(
+                mode=_net_mode, override=_net_override
+            )
+            logger.info(f"Registering with IP {_real_ip} (mode={_net_mode_used})")
             resp = httpx.post(
                 f"{settings.backend_url}/register",
                 json={
@@ -533,7 +533,10 @@ try:
                                     f"{settings.backend_url}/register",
                                     json={
                                         "worker_name": settings.worker_name,
-                                        "host": get_local_ips()[0],
+                                        "host": resolve_registration_ip(
+                                            mode=os.environ.get("WORKER_NETWORK_MODE", "auto"),
+                                            override=os.environ.get("WORKER_REGISTER_HOST"),
+                                        )[0],
                                         "port": settings.port,
                                     },
                                     headers=hdrs,
